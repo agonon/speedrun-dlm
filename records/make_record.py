@@ -24,7 +24,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-AR_REFERENCE_TFLOPS = 89.246627803648
+AR_REFERENCE_TFLOPS = 95.863037506048
 AR_REFERENCE_TOTAL_PARAMETERS = 124_318_464
 DEFAULT_SOURCE_FILES = [
     "generation_quality_rule.json",
@@ -51,7 +51,9 @@ RECORDS_CSV_FIELDS = [
     "mean_pass_rate",
     "sampler",
     "nmc",
-    "inference_profiler_tflops_per_1024_token_sample",
+    "inference_tflops_per_1024_token_sample",
+    "torch_profiler_tflops_per_1024_token_sample",
+    "attention_tflops_added_by_formula",
     "inference_tflops_vs_ar",
     "parameter_normalized_inference_tflops_vs_ar",
     "diversity_unigram_entropy_bits_mean",
@@ -318,14 +320,19 @@ def build_records_row(
     pass_rates = [float(row["pass_rate"]) for row in gate_rows]
     parameters_total = first_train.get("num_parameters") or inference.get("num_parameters", "")
     non_embedding_parameters = first_train.get("non_embedding_parameters") or inference.get("non_embedding_parameters", "")
-    tflops = float(inference["profiler_tflops_per_1024_token_sample"])
-    tflops_vs_ar = float(inference.get("inference_tflops_vs_ar") or (tflops / args.ar_reference_tflops))
-    if inference.get("parameter_normalized_inference_tflops_vs_ar"):
-        parameter_normalized_tflops_vs_ar = float(inference["parameter_normalized_inference_tflops_vs_ar"])
-    else:
-        parameter_normalized_tflops_vs_ar = tflops_vs_ar * (
-            args.ar_reference_total_parameters / float(parameters_total)
-        )
+    tflops = float(
+        inference.get("total_tflops_per_1024_token_sample")
+        or inference["profiler_tflops_per_1024_token_sample"]
+    )
+    profiler_tflops = float(inference["profiler_tflops_per_1024_token_sample"])
+    attention_tflops = float(
+        inference.get("attention_tflops_added_by_formula_per_1024_token_sample")
+        or 0.0
+    )
+    tflops_vs_ar = tflops / args.ar_reference_tflops
+    parameter_normalized_tflops_vs_ar = tflops_vs_ar * (
+        args.ar_reference_total_parameters / float(parameters_total)
+    )
     timed = [float(row["timed_training_seconds"]) for row in training_rows if row.get("timed_training_seconds") is not None]
     wall = [
         float(row["total_wallclock_seconds"])
@@ -347,7 +354,9 @@ def build_records_row(
         "mean_pass_rate": f"{mean(pass_rates):.4f}",
         "sampler": args.sampler,
         "nmc": model_calls_for_gate_sample(args, inference),
-        "inference_profiler_tflops_per_1024_token_sample": f"{tflops:.4f}",
+        "inference_tflops_per_1024_token_sample": f"{tflops:.4f}",
+        "torch_profiler_tflops_per_1024_token_sample": f"{profiler_tflops:.4f}",
+        "attention_tflops_added_by_formula": f"{attention_tflops:.4f}",
         "inference_tflops_vs_ar": f"{tflops_vs_ar:.4f}",
         "parameter_normalized_inference_tflops_vs_ar": f"{parameter_normalized_tflops_vs_ar:.4f}",
         "diversity_unigram_entropy_bits_mean": diversity["unigram_entropy_bits_mean"],

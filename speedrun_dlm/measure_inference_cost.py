@@ -16,6 +16,15 @@ from .sample_text import (
 )
 
 
+ATTENTION_FLOP_EVENT_MARKERS = (
+    "scaled_dot_product",
+    "flash_attention",
+    "efficient_attention",
+    "aten::bmm",
+    "aten::baddbmm",
+)
+
+
 def checkpoint_label(path: str) -> str:
     return Path(path).name or path
 
@@ -47,6 +56,32 @@ def make_generator(device: str, seed: int) -> torch.Generator:
     generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
     generator.manual_seed(seed)
     return generator
+
+
+def causal_attention_pairs_over_generation(generated_tokens: int, context_length: int, prompt_tokens: int = 1) -> float:
+    total = 0.0
+    for step in range(generated_tokens):
+        seq_len = min(prompt_tokens + step, context_length)
+        total += seq_len * (seq_len + 1) / 2
+    return total
+
+
+def estimate_sdpa_flops_per_sample(snapshot, tokens: int, forward_calls_per_sample: float) -> float:
+    """Estimate QK^T and attention-value FLOPs missing from PyTorch SDPA profiler events."""
+    config = snapshot.model.config
+    layers = int(config.n_layer)
+    width = int(config.n_embd)
+    if snapshot.trainer == "ar":
+        pairs = causal_attention_pairs_over_generation(tokens, int(config.block_size))
+    elif snapshot.trainer == "dlm":
+        pairs = forward_calls_per_sample * tokens * tokens
+    else:
+        return 0.0
+    return float(layers * 4 * width * pairs)
+
+
+def is_attention_flop_event(key: str) -> bool:
+    return any(marker in key for marker in ATTENTION_FLOP_EVENT_MARKERS)
 
 
 def run_one_sample(
@@ -109,7 +144,7 @@ def profile_samples(
     dlm_sampler: str,
     num_sampling_steps: int,
     sampling_eps: float,
-) -> tuple[int, float, int]:
+) -> tuple[int, int, float, int]:
     with ForwardCounter(snapshot.model) as counter:
         cuda_sync(device)
         start = time.perf_counter()
@@ -135,8 +170,12 @@ def profile_samples(
                 )
         cuda_sync(device)
         elapsed = time.perf_counter() - start
-    flops = int(sum(getattr(event, "flops", 0) or 0 for event in prof.key_averages()))
-    return flops, elapsed, counter.calls
+    events = prof.key_averages()
+    flops = int(sum(getattr(event, "flops", 0) or 0 for event in events))
+    attention_flops = int(
+        sum((getattr(event, "flops", 0) or 0) for event in events if is_attention_flop_event(event.key))
+    )
+    return flops, attention_flops, elapsed, counter.calls
 
 
 def write_markdown(payload: dict[str, Any], path: Path) -> None:
@@ -156,17 +195,24 @@ def write_markdown(payload: dict[str, Any], path: Path) -> None:
         f"- DLM sampling steps: `{payload['dlm_sampling_steps']}`",
         f"- DLM sampling eps: `{payload['sampling_eps']}`",
         f"- forward calls per sample: `{payload['forward_calls_per_sample']:.6g}`",
-        f"- profiler FLOPs per sample: `{payload['profiler_flops_per_sample']:.6g}`",
-        f"- profiler TFLOPs per sample: `{payload['profiler_tflops_per_sample']:.6g}`",
-        f"- profiler FLOPs per 128-sample gate: `{payload['profiler_flops_per_128_sample_gate']:.6g}`",
-        f"- profiler FLOPs per 1024 samples: `{payload['profiler_flops_per_1024_samples']:.6g}`",
+        f"- PyTorch profiler FLOPs per sample: `{payload['profiler_flops_per_sample']:.6g}`",
+        f"- attention FLOPs already measured by PyTorch: `{payload['attention_flops_measured_by_torch_per_sample']:.6g}`",
+        f"- attention FLOPs from formula: `{payload['attention_flops_by_formula_per_sample']:.6g}`",
+        f"- attention FLOPs added by formula: `{payload['attention_flops_added_by_formula_per_sample']:.6g}`",
+        f"- total FLOPs per sample: `{payload['total_flops_per_sample']:.6g}`",
+        f"- PyTorch profiler TFLOPs per sample: `{payload['profiler_tflops_per_sample']:.6g}`",
+        f"- total TFLOPs per sample: `{payload['total_tflops_per_sample']:.6g}`",
+        f"- PyTorch profiler FLOPs per 128-sample gate: `{payload['profiler_flops_per_128_sample_gate']:.6g}`",
+        f"- total FLOPs per 128-sample gate: `{payload['total_flops_per_128_sample_gate']:.6g}`",
+        f"- PyTorch profiler FLOPs per 1024 samples: `{payload['profiler_flops_per_1024_samples']:.6g}`",
+        f"- total FLOPs per 1024 samples: `{payload['total_flops_per_1024_samples']:.6g}`",
         f"- wall seconds per sample: `{payload['wall_seconds_per_sample']:.6g}`",
         f"- CUDA max memory MiB: `{payload['cuda_max_memory_mib']:.1f}`",
         "",
         "## Notes",
         "",
-        "- FLOPs are estimated by `torch.profiler.profile(with_flops=True)` on the actual sampler path.",
-        "- The profiler only counts operators for which PyTorch reports FLOPs; keep the JSON artifact with every record.",
+        "- PyTorch FLOPs are measured with `torch.profiler.profile(with_flops=True)` while running the sampling code.",
+        "- Attention FLOPs are added by formula only for the part not already counted by PyTorch.",
         "- Warmup samples run before profiling and are not included in the reported FLOPs or wall time.",
     ]
     path.write_text("\n".join(lines) + "\n")
@@ -221,7 +267,7 @@ def main() -> None:
         )
     cuda_sync(device)
 
-    flops, elapsed, forward_calls = profile_samples(
+    flops, measured_attention_flops, elapsed, forward_calls = profile_samples(
         snapshot,
         tokens=args.tokens,
         measured_samples=args.measured_samples,
@@ -237,6 +283,13 @@ def main() -> None:
 
     per_sample_flops = flops / max(args.measured_samples, 1)
     per_sample_calls = forward_calls / max(args.measured_samples, 1)
+    measured_attention_flops_per_sample = measured_attention_flops / max(args.measured_samples, 1)
+    attention_flops_by_formula_per_sample = estimate_sdpa_flops_per_sample(snapshot, args.tokens, per_sample_calls)
+    attention_flops_added_by_formula_per_sample = max(
+        attention_flops_by_formula_per_sample - measured_attention_flops_per_sample,
+        0.0,
+    )
+    total_flops_per_sample = per_sample_flops + attention_flops_added_by_formula_per_sample
     payload: dict[str, Any] = {
         "snapshot": checkpoint_label(args.snapshot_path),
         "trainer": snapshot.trainer,
@@ -261,16 +314,53 @@ def main() -> None:
         "profiler_flops_per_1024_token_sample": per_sample_flops if args.tokens == 1024 else None,
         "profiler_tflops_per_sample": per_sample_flops / 1e12,
         "profiler_tflops_per_1024_token_sample": per_sample_flops / 1e12 if args.tokens == 1024 else None,
+        "attention_flops_measured_by_torch_per_sample": measured_attention_flops_per_sample,
+        "attention_flops_measured_by_torch_per_1024_token_sample": (
+            measured_attention_flops_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_measured_by_torch_per_sample": measured_attention_flops_per_sample / 1e12,
+        "attention_tflops_measured_by_torch_per_1024_token_sample": (
+            measured_attention_flops_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "attention_flops_by_formula_per_sample": attention_flops_by_formula_per_sample,
+        "attention_flops_by_formula_per_1024_token_sample": (
+            attention_flops_by_formula_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_by_formula_per_sample": attention_flops_by_formula_per_sample / 1e12,
+        "attention_tflops_by_formula_per_1024_token_sample": (
+            attention_flops_by_formula_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "attention_flops_added_by_formula_per_sample": attention_flops_added_by_formula_per_sample,
+        "attention_flops_added_by_formula_per_1024_token_sample": (
+            attention_flops_added_by_formula_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_added_by_formula_per_sample": attention_flops_added_by_formula_per_sample / 1e12,
+        "attention_tflops_added_by_formula_per_1024_token_sample": (
+            attention_flops_added_by_formula_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "total_flops_per_sample": total_flops_per_sample,
+        "total_flops_per_1024_token_sample": total_flops_per_sample if args.tokens == 1024 else None,
+        "total_tflops_per_sample": total_flops_per_sample / 1e12,
+        "total_tflops_per_1024_token_sample": total_flops_per_sample / 1e12 if args.tokens == 1024 else None,
         "profiler_flops_per_128_sample_gate": per_sample_flops * 128,
         "profiler_flops_per_1024_samples": per_sample_flops * 1024,
+        "total_flops_per_128_sample_gate": total_flops_per_sample * 128,
+        "total_flops_per_1024_samples": total_flops_per_sample * 1024,
+        "attention_flops_formula": (
+            "AR: layers * 4 * width * sum_t L_t(L_t+1)/2; "
+            "DLM: layers * 4 * width * forward_calls * tokens^2"
+        ),
         "wall_seconds_total": elapsed,
         "wall_seconds_per_sample": elapsed / max(args.measured_samples, 1),
         "cuda_max_memory_mib": (
             torch.cuda.max_memory_allocated() / (1024**2) if device.startswith("cuda") else 0.0
         ),
         "profiler": "torch.profiler.profile(with_flops=True)",
-        "cost_accounting_version": "v0.1-torch-profiler-actual-sampler",
-        "profiler_caveat": "PyTorch reports FLOPs only for supported operators; keep this with sampler config.",
+        "cost_accounting_version": "v0.2-torch-profiler-plus-sdpa-estimate",
+        "profiler_caveat": (
+            "PyTorch reports FLOPs only for supported operators. total_* fields add the attention "
+            "formula only for the part not already measured by PyTorch."
+        ),
     }
 
     if args.output_json:

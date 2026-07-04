@@ -19,7 +19,7 @@ We then adapted it to diffusion language models in `speedrun_dlm/train_dlm.py`.
 
 The DLM trainer is longer because it already includes our re-implementations of **7 common single-block diffusion objectives**. 
 
-> Note. Original methods and ideas belong to their respective authors. This is an independent project and is not affiliated with or sponsored by modded-nanogpt, its contributors, or the authors of the papers we cite.
+> Note. Original methods and ideas belong to their respective authors. This is an independent project and is not affiliated with modded-nanogpt, its contributors, or the authors of the papers we cite.
 
 
 ## Contents
@@ -39,18 +39,17 @@ The DLM trainer is longer because it already includes our re-implementations of 
 
 We also include the auto-regressive (AR) nanoGPT-2 model as a reference baseline. The DLM architecture used here, DDiT, keeps the same basic shape as nanoGPT-2, with small changes needed for diffusion.
 
-A DLM entry must **pass the gate while using less than 89.25 TFLOPs** for one 1024-token sample. 
+A DLM entry must **pass the gate while using less than 95.86 TFLOPs** for one 1024-token sample. 
 This is the cost of the AR reference without KV cache. 
-We compare to AR models *without KV cache* since single-block DLMs cannot use KV caching, so the uncached AR is a more realistic target given the current state of the literature. 
-
-
+We compare to this uncached AR cost because this benchmark uses single-block full-sequence DLM samplers, for which KV caching is not possible.  
 
 | Rank | Entry | Train time | Success rate | Training tokens | Training steps | Inference TFLOPs for 1024-token sample | Number of model calls for 1024-token sample | Record |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| reference baseline | AR nanoGPT-2 | [40.6s](records/ar-baseline/training_runs.jsonl) | [49 out of 50 seeds](records/ar-baseline/gate_passes.tsv) | [131M](records/ar-baseline/training_runs.jsonl) | [500](records/ar-baseline/training_runs.jsonl) | [89.25](records/ar-baseline/auxiliary_metrics.json) (0.25 with KV cache) | [1024](records/records.csv) | [ar-baseline](records/ar-baseline/) |
-| 1 | `subs_mask` | [27m45.2s](records/0001-subs-mask-s344/training_runs.jsonl) | [44 out of 50 seeds](records/0001-subs-mask-s344/gate_passes.tsv) | [3.28B](records/0001-subs-mask-s344/training_runs.jsonl) | [8000](records/0001-subs-mask-s344/training_runs.jsonl) | [82.56](records/0001-subs-mask-s344/auxiliary_metrics.json) | [344](records/records.csv) | [0001](records/0001-subs-mask-s344/) |
+| reference baseline | AR nanoGPT-2 | [40.6s](records/ar-baseline/training_runs.jsonl) | [49 out of 50 seeds](records/ar-baseline/gate_passes.tsv) | [131M](records/ar-baseline/training_runs.jsonl) | [500](records/ar-baseline/training_runs.jsonl) | [95.86](records/ar-baseline/auxiliary_metrics.json) (0.27 with KV cache) | [1024](records/records.csv) | [ar-baseline](records/ar-baseline/) |
+| 1 | `subs_mask` | [27m45.2s](records/0001-subs-mask-s344/training_runs.jsonl) | [44 out of 50 seeds](records/0001-subs-mask-s344/gate_passes.tsv) | [3.28B](records/0001-subs-mask-s344/training_runs.jsonl) | [8000](records/0001-subs-mask-s344/training_runs.jsonl) | [95.16](records/0001-subs-mask-s344/auxiliary_metrics.json) | [344](records/records.csv) | [0001](records/0001-subs-mask-s344/) |
 
 For DLMs, the number of model calls is simply the number of denoising steps. For the AR reference, it is the sequence length since it requires one model call per token.
+Inference TFLOPs are FLOPs counted by PyTorch while sampling, plus the attention FLOPs PyTorch did not count. See the appendix for the formula.
 
 ## Rules
 
@@ -59,7 +58,7 @@ For DLMs, the number of model calls is simply the number of denoising steps. For
 - Same *hardware*: 8 H100 80GB GPUs.
 - Same *quality gate*: 128 unconditional samples of 1024 tokens.
 - A seed passes if at least 108 out of 128 samples pass.
-- A DLM sampler must cost less than 89.25 TFLOPs for one 1024-token sample.
+- A DLM sampler must cost less than 95.86 TFLOPs for one 1024-token sample.
 - Runs are ranked by mean training time over 50 seeds.
 - A record needs at least 42 out of 50 seeds to pass.
 
@@ -87,8 +86,7 @@ We use this model in `speedrun_dlm/train_ar.py`, then adapt it to DLMs in `speed
 
 Most of the gap in parameters comes from the untied output head.
 
-_Remark on FLOPS:_ For one 1024-token model call, a DDiT call uses roughly twice the FLOPs of the AR reference (when using *no* KV cache, otherwise the AR reference is 500x lower but single-block DLMs cannot use KV cache). This is mostly due to the non-causal attention (meaning there are basically twice as many dot products to compute: ~20% of the extra cost, and 
-twice the number of tokens to process in the linear embedding layers like qkv: ~80% of the extra cost). 
+_Remark on FLOPs:_ For one 1024-token model call, a DDiT call uses roughly twice the FLOPs of the AR reference (when using *no* KV cache, otherwise the AR reference is 350x lower but single-block DLMs cannot use KV cache). This extra cost is mostly due to the non-causal attention (meaning there are basically twice as many dot products to compute: ~20% of the extra cost, and twice the number of tokens to process in the linear embedding layers like qkv: ~80% of the extra cost). 
 
 More details: [per-block parameter figure](assets/figures/architecture-params-per-layer.svg), [per-block FLOPs figure](assets/figures/architecture-flops-per-layer.svg), [extra FLOPs figure](assets/figures/architecture-additional-flops.svg).
 
@@ -136,7 +134,7 @@ python records/make_record.py \
 ```
 
 Each submitted entry should include 50 seeds, report how many seeds pass the
-gate, keep an `environment.json` snapshot, and stay below 89.25 TFLOPs for one
+gate, keep an `environment.json` snapshot, and stay below 95.86 TFLOPs for one
 1024-token sample. We will check the timing and record artifacts on our cluster
 for each PR.
 

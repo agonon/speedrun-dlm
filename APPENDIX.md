@@ -66,3 +66,46 @@ Sampler names are listed in [`sample_text.py`](speedrun_dlm/sample_text.py).
 | D3PM | [D3PM](https://arxiv.org/abs/2107.03006) | `d3pm_mask_ancestral`, `d3pm_uniform_ancestral`, uniform checkpoints also allow DUO Psi samplers |
 | SEDD | [SEDD](https://arxiv.org/abs/2310.16834) | `sedd_euler`, `sedd_analytic` |
 | DUO | [DUO](https://arxiv.org/abs/2506.10892), [Psi samplers](https://arxiv.org/abs/2602.21185) | `duo_ancestral`, `duo_greedy_tail`, `duo_psi_rescale`, `duo_psi_capped`, `duo_psi_loop` |
+
+
+## Inference cost accounting
+
+Leaderboard TFLOPs use the `total_*` fields in each record's `auxiliary_metrics.json`.
+
+PyTorch measures the FLOPs of different operations with
+
+```python
+torch.profiler.profile(with_flops=True)
+```
+
+In our setup, PyTorch reports `0` FLOPs for `scaled_dot_product_attention`.
+So we add the FLOPs for the two attention matrix products by formula:
+
+```text
+QK^T FLOPs = 2 * width * pairs
+AV FLOPs   = 2 * width * pairs
+total attention FLOPs = 4 * width * pairs
+```
+
+Here `width = 768` and there are `12` layers. We count only these two matrix products, not softmax or other small elementwise work.
+
+For one 1024-token sample:
+
+```text
+AR without KV cache:
+12 * 4 * 768 * sum_{t=1}^{1024} t(t+1)/2
+
+AR with KV cache:
+12 * 4 * 768 * sum_{t=1}^{1024} t
+
+DLM:
+12 * 4 * 768 * forward_calls * 1024^2
+```
+
+The profiling is done before record creation with:
+
+```bash
+python -m speedrun_dlm.measure_inference_cost ...
+```
+
+That script runs the sampler, reads PyTorch profiler FLOPs, adds the missing attention FLOPs, and writes the `total_*` fields to an inference-cost JSON file. Then `records/make_record.py` copies that JSON into `auxiliary_metrics.json` and uses the `total_tflops_per_1024_token_sample` field for `records.csv`.
