@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="320" viewBox="0 0 1000 320" role="img">
+<defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1f2933; }
+.title { font-size: 26px; font-weight: 700; }
+.subtitle { font-size: 14px; fill: #5b6773; }
+.label { font-size: 14px; font-weight: 600; }
+.small { font-size: 12px; fill: #5b6773; }
+.tiny { font-size: 11px; fill: #5b6773; }
+.mono { font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2933; }
+.value { font-size: 13px; font-weight: 650; }
+</style>
+<pattern id="diag" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+<rect width="8" height="8" fill="#edf1f5"/>
+<line x1="0" y1="0" x2="0" y2="8" stroke="#8b96a3" stroke-width="3"/>
+</pattern>
+</defs>
+<rect x="0" y="0" width="1000" height="320" fill="#ffffff"/>
+<text x="40.0" y="48.0" text-anchor="start" class="title">Inference FLOPs for one 1024-token sample</text>
+<text x="40.0" y="75.0" text-anchor="start" class="subtitle">Measured: nn.Linear via torch.profiler. Estimated: SDPA by formula.</text>
+<text x="40.0" y="101.0" text-anchor="start" class="label">nanoGPT-2 89.25 TF | DDiT 157.56 TF | extra 68.31 TF measured + 17.43 TF estimated SDPA</text>
+<text x="70.0" y="118.0" text-anchor="start" class="label">Extra FLOPs breakdown</text>
+<rect x="70.0" y="132.0" width="486.7" height="56.0" fill="#e15759"/>
+<text x="313.3" y="165.0" text-anchor="middle" class="value" style="fill: #ffffff">49.1T</text>
+<rect x="556.7" y="132.0" width="188.8" height="56.0" fill="#59a14f"/>
+<text x="651.1" y="165.0" text-anchor="middle" class="value" style="fill: #ffffff">19.0T</text>
+<rect x="745.6" y="132.0" width="1.7" height="56.0" fill="#bab0ac"/>
+<rect x="747.2" y="132.0" width="172.8" height="56.0" fill="url(#diag)" stroke="#1f2933"/>
+<text x="833.6" y="165.0" text-anchor="middle" class="value">17.4T</text>
+<rect x="70.0" y="132.0" width="850.0" height="56.0" fill="none" stroke="#1f2933"/>
+<text x="70.0" y="210.0" text-anchor="start" class="small">0 TF</text>
+<text x="920.0" y="210.0" text-anchor="end" class="small">85.74 TF</text>
+<rect x="70.0" y="225.0" width="14.0" height="14.0" fill="#e15759"/>
+<text x="90.0" y="236.0" text-anchor="start" class="small">DDiT output head 57.3%</text>
+<rect x="300.0" y="225.0" width="14.0" height="14.0" fill="#59a14f"/>
+<text x="320.0" y="236.0" text-anchor="start" class="small">extra full-seq block linears 22.2%</text>
+<rect x="610.0" y="225.0" width="14.0" height="14.0" fill="url(#diag)" stroke="#1f2933"/>
+<text x="630.0" y="236.0" text-anchor="start" class="small">estimated SDPA 20.3%</text>
+<rect x="70.0" y="254.0" width="14.0" height="14.0" fill="#b07aa1"/>
+<text x="90.0" y="265.0" text-anchor="start" class="small">adaLN/time-conditioning 0.0%</text>
+<rect x="360.0" y="254.0" width="14.0" height="14.0" fill="#bab0ac"/>
+<text x="380.0" y="265.0" text-anchor="start" class="small">other measured ops 0.2%</text>
+<text x="70.0" y="300.0" text-anchor="start" class="tiny">SDPA estimate: 4 x B x H x P x d_h; P=T(T+1)/2 causal, P=T^2 non-causal.</text>
+</svg>

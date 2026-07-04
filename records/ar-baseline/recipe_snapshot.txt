@@ -1,0 +1,4606 @@
+# Recipe snapshot
+
+Source files defining the trainer, sampler, and gate.
+
+===== generation_quality_rule.json =====
+{
+  "version": "v0-strict-doccoh",
+  "candidate_reference_model": "Qwen/Qwen2.5-7B",
+  "deterministic_preset": "medium",
+  "bpb_threshold": 2.1,
+  "pass_rate_threshold": 0.75,
+  "max_bad_char_count": 0.0,
+  "order_protocols": [
+    "unconditional"
+  ],
+  "order_min_pairs": 4.0,
+  "order_contrast_acc_threshold": 0.375,
+  "order_contrast_margin_threshold": null,
+  "order_shuffle_acc_threshold": null,
+  "doc_coherence_protocols": [
+    "unconditional"
+  ],
+  "doc_coherence_min_corruptions": 5.0,
+  "doc_coherence_win_rate_threshold": null,
+  "doc_coherence_margin_threshold": -0.2,
+  "doc_coherence_kind_margin_thresholds": {},
+  "significance_p_value": 0.01
+}
+
+
+===== run_ar.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+OUTPUT_DIR=${OUTPUT_DIR:-results/ar_run}
+
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_ar \
+  --model "${MODEL:-d12}" \
+  --batch_size "${BATCH_SIZE:-32}" \
+  --sequence_length "${SEQUENCE_LENGTH:-1024}" \
+  --total_batch_size "${TOTAL_BATCH_SIZE:-262144}" \
+  --num_iterations "${NUM_ITERATIONS:-500}" \
+  --num_checkpoints "${NUM_CHECKPOINTS:-1}" \
+  --learning_rate "${LEARNING_RATE:-3e-4}" \
+  --warmup_iters "${WARMUP_ITERS:-320}" \
+  --seed "${SEED:-1337}" \
+  --val_loss_every "${VAL_LOSS_EVERY:-500}" \
+  --val_max_steps "${VAL_MAX_STEPS:-8}" \
+  --output_dir "$OUTPUT_DIR" \
+  "$@"
+
+
+===== run_dlm.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+OUTPUT_DIR=${OUTPUT_DIR:-results/dlm_run}
+DLM_OBJECTIVE="${DLM_OBJECTIVE:-${OBJECTIVE:-subs_mask}}"
+DLM_NOISE_SCHEDULE="${DLM_NOISE_SCHEDULE:-${NOISE_SCHEDULE:-}}"
+NOISE_SCHEDULE_ARGS=()
+if [[ -n "$DLM_NOISE_SCHEDULE" ]]; then
+  NOISE_SCHEDULE_ARGS+=(--noise_schedule "$DLM_NOISE_SCHEDULE")
+fi
+D3PM_COEFF_ARGS=()
+if [[ -n "${DLM_D3PM_VB_COEFF:-}" ]]; then
+  D3PM_COEFF_ARGS+=(--d3pm_vb_coeff "$DLM_D3PM_VB_COEFF")
+fi
+if [[ -n "${DLM_D3PM_CE_COEFF:-}" ]]; then
+  D3PM_COEFF_ARGS+=(--d3pm_ce_coeff "$DLM_D3PM_CE_COEFF")
+fi
+CHECKPOINT_STEPS_ARGS=()
+if [[ -n "${CHECKPOINT_STEPS:-}" ]]; then
+  CHECKPOINT_STEPS_ARGS+=(--checkpoint_steps "$CHECKPOINT_STEPS")
+fi
+DUO_ARGS=(
+  --duo_curriculum_mode "${DLM_DUO_CURRICULUM_MODE:-softmax}"
+  --duo_keep_prob_table_path "${DLM_DUO_KEEP_PROB_TABLE_PATH:-}"
+  --duo_top_k "${DLM_DUO_TOP_K:-32}"
+  --duo_log_noise_ratio_min "${DLM_DUO_LOG_NOISE_RATIO_MIN:--3.55}"
+  --duo_log_noise_ratio_max "${DLM_DUO_LOG_NOISE_RATIO_MAX:--1.85}"
+  --duo_softmax_temperature_log10_start "${DLM_DUO_SOFTMAX_TEMPERATURE_LOG10_START:--3.0}"
+  --duo_softmax_temperature_log10_end "${DLM_DUO_SOFTMAX_TEMPERATURE_LOG10_END:--3.0}"
+  --duo_curriculum_start "${DLM_DUO_CURRICULUM_START:-0}"
+  --duo_curriculum_end "${DLM_DUO_CURRICULUM_END:-500000}"
+)
+
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_dlm \
+  --model "${MODEL:-d12}" \
+  --batch_size "${BATCH_SIZE:-50}" \
+  --sequence_length "${SEQUENCE_LENGTH:-1024}" \
+  --total_batch_size "${TOTAL_BATCH_SIZE:-409600}" \
+  --num_iterations "${NUM_ITERATIONS:-5040}" \
+  --num_checkpoints "${NUM_CHECKPOINTS:-1}" \
+  "${CHECKPOINT_STEPS_ARGS[@]}" \
+  --learning_rate "${LEARNING_RATE:-3e-4}" \
+  --adam_beta1 0.9 \
+  --adam_beta2 0.999 \
+  --adam_eps 1e-8 \
+  --objective "$DLM_OBJECTIVE" \
+  "${NOISE_SCHEDULE_ARGS[@]}" \
+  --continuous_time_eps "${DLM_CONTINUOUS_TIME_EPS:-1e-3}" \
+  --geometric_noise_level_min "${DLM_GEOMETRIC_NOISE_LEVEL_MIN:-0.0001}" \
+  --geometric_noise_level_max "${DLM_GEOMETRIC_NOISE_LEVEL_MAX:-20.0}" \
+  --num_diffusion_steps "${DLM_NUM_DIFFUSION_STEPS:-1000}" \
+  --cond_dim "${DLM_COND_DIM:-128}" \
+  --dropout "${DLM_DROPOUT:-0.1}" \
+  --warmup_iters "${WARMUP_ITERS:-384}" \
+  --seed "${SEED:-1337}" \
+  --val_loss_every "${VAL_LOSS_EVERY:-5040}" \
+  --val_max_steps "${VAL_MAX_STEPS:-8}" \
+  --output_dir "$OUTPUT_DIR" \
+  "${D3PM_COEFF_ARGS[@]}" \
+  "${DUO_ARGS[@]}" \
+  "$@"
+
+
+===== speedrun_dlm/train_ar.py =====
+import argparse
+import glob
+import json
+import math
+import os
+import time
+import uuid
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import torch._inductor.config as inductor_config
+import torch.nn.functional as F
+from torch import nn
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+with open(__file__) as f:
+    code = f.read()
+
+
+DATA_HEADER_INTS = 256
+DATA_FILE_MAGIC = 20240520
+DATA_FILE_VERSION = 1
+
+
+def rmsnorm(x0: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x = x0.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return x.type_as(x0)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # no kv cache here this is the simple baseline path
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, channels = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        q = q.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, channels)
+        y = self.c_proj(y)
+        y = y / math.sqrt(24)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.c_proj(F.gelu(self.c_fc(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(rmsnorm(x))
+        x = x + self.mlp(rmsnorm(x))
+        return x
+
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+
+
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wpe=nn.Embedding(config.block_size, config.n_embd),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            )
+        )
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.LLMC_SKIP_INIT = 1 # not initialized, we will tie weights
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Embedding) and not hasattr(module, "LLMC_SKIP_INIT"):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # for position embeddings, std=0.02 to match scale of token embeddings
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, return_logits: bool = True):
+        bsz, seq_len = idx.size()
+        assert seq_len <= self.config.block_size, (
+            f"Cannot forward sequence of length {seq_len}, block size is only {self.config.block_size}"
+        )
+        pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        x = rmsnorm(x)
+
+        loss = None
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+
+        if not return_logits:
+            logits = None
+        return logits, loss
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas):
+        return torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
+
+
+def _peek_data_shard(filename: str) -> int:
+    with open(filename, "rb") as f:
+        header = np.frombuffer(f.read(DATA_HEADER_INTS * 4), dtype=np.int32)
+    if header[0] != DATA_FILE_MAGIC:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --train_files?")
+        raise SystemExit(1)
+    assert header[1] == DATA_FILE_VERSION, "unsupported version"
+    return int(header[2])
+
+
+def _load_data_shard(filename: str) -> np.ndarray:
+    with open(filename, "rb") as f:
+        header = np.frombuffer(f.read(DATA_HEADER_INTS * 4), dtype=np.int32)
+        assert header[0] == DATA_FILE_MAGIC, "magic number mismatch in the data .bin file"
+        assert header[1] == DATA_FILE_VERSION, "unsupported version"
+        ntok = int(header[2])
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header"
+    return tokens
+
+
+class DistributedDataLoader:
+    def __init__(
+        self,
+        filename_pattern: str,
+        batch_size: int,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        name: str,
+    ):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.files = sorted(glob.glob(filename_pattern))
+        assert self.files, f"did not find any files matching {filename_pattern}"
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * batch_size * seq_len + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"{name} data: {ntok_total:,} tokens across {len(self.files)} files")
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self):
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        batch_size = self.batch_size
+        seq_len = self.seq_len
+        buf = self.tokens[self.current_position : self.current_position + batch_size * seq_len + 1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = buf[:-1].view(batch_size, seq_len)
+        y = buf[1:].view(batch_size, seq_len)
+        self.current_position += batch_size * seq_len * self.num_processes
+        if self.current_position + (batch_size * seq_len * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+
+def print0(*args, **kwargs):
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*args, **kwargs)
+
+
+def get_model_config(model_name: str) -> GPTConfig:
+    return {
+        "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+        "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+        "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+        "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+    }[model_name]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_files", type=str, default="data/fineweb10B/fineweb_train_*.bin")
+    parser.add_argument("--val_files", type=str, default="data/fineweb10B/fineweb_val_*.bin")
+    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--model", choices=("d12", "d24", "d36", "d48"), default="d12")
+    # AR keeps a smaller default batch than DLM because validation loss degrades at the same token budget.
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--sequence_length", type=int, default=1024)
+    parser.add_argument("--total_batch_size", type=int, default=32 * 1024 * 8)
+    parser.add_argument("--num_iterations", type=int, default=10)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--warmup_iters", type=int, default=0)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--val_loss_every", type=int, default=0)
+    parser.add_argument("--val_max_steps", type=int, default=20)
+    parser.add_argument(
+        "--num_checkpoints",
+        type=int,
+        default=1,
+        help=(
+            "Total number of checkpoints to save over the run, including the final one. "
+            "Checkpoints are spaced uniformly in training steps. "
+            "Current checkpoints store fp32 model weights only: d12 is ~474 MiB each, "
+            "d24 is ~1.32 GiB, d36 is ~2.88 GiB, d48 is ~5.80 GiB."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint_steps",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated optimizer step numbers to checkpoint. "
+            "When set, this overrides --num_checkpoints for intermediate checkpoints. "
+            "The final checkpoint is always saved after training."
+        ),
+    )
+    args = parser.parse_args()
+
+    batch_size, seq_len = args.batch_size, args.sequence_length
+    assert 1 <= seq_len <= 1024
+    assert args.model in {"d12", "d24", "d36", "d48"}
+    assert args.num_checkpoints >= 1
+    assert torch.cuda.is_available(), "CUDA is required for this trainer"
+
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+    rank_seed = args.seed + ddp_rank
+    torch.manual_seed(rank_seed)
+    np.random.seed(rank_seed)
+    print0(f"PyTorch: {torch.version.__version__}")
+    print0(f"Device: {device}")
+    print0(f"seed: base {args.seed} | rank0 local seed {args.seed}")
+
+    tokens_per_step = batch_size * seq_len * ddp_world_size
+    assert args.total_batch_size == tokens_per_step
+
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    model = GPT(get_model_config(args.model)).train().cuda()
+    num_parameters = sum(p.numel() for p in model.parameters())
+    non_embedding_parameters = sum(p.numel() for name, p in model.named_parameters() if "transformer.wte" not in name)
+    if hasattr(inductor_config, "coordinate_descent_tuning"):
+        inductor_config.coordinate_descent_tuning = True
+    print0("Compiling model...")
+    model = torch.compile(model)
+
+    train_loader = DistributedDataLoader(args.train_files, batch_size, seq_len, ddp_rank, ddp_world_size, name="train")
+    val_loader = (
+        DistributedDataLoader(args.val_files, batch_size, seq_len, ddp_rank, ddp_world_size, name="val")
+        if args.val_files
+        else None
+    )
+    x, y = train_loader.next_batch()
+
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module
+    optimizer = raw_model.configure_optimizers(
+        weight_decay=args.weight_decay,
+        learning_rate=args.learning_rate,
+        betas=(0.9, 0.95),
+    )
+    print0(f"Parameters: total {num_parameters:,} | non-token-embedding {non_embedding_parameters:,}")
+    print0("Warming up compiled training step...")
+    model.train()
+    with ctx:
+        _, warmup_loss = model(x, y, return_logits=False)
+    warmup_loss.backward()
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    overall_t0 = time.perf_counter()
+
+    def get_lr(it: int) -> float:
+        assert it <= args.num_iterations
+        if args.warmup_iters > 0 and it < args.warmup_iters:
+            return args.learning_rate * (it + 1) / args.warmup_iters
+        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        return (0.1 + (1 - decay_ratio)) / 1.1 * args.learning_rate
+
+    run_id = str(uuid.uuid4())
+    logfile = None
+    last_val_loss = None
+    if master_process and args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, f"{run_id}.log")
+        with open(logfile, "w"):
+            pass
+    checkpoint_paths = []
+    checkpoint_records = []
+
+    def record_path(path: str) -> str:
+        checkpoint_dir = args.output_dir if args.output_dir else "logs"
+        try:
+            return os.path.relpath(path, checkpoint_dir)
+        except ValueError:
+            return os.path.basename(path)
+
+    def checkpoint_state_dict() -> dict[str, torch.Tensor]:
+        checkpoint_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
+        return checkpoint_model.state_dict()
+
+    def save_checkpoint(tag: str, step: int, timed_elapsed: float, wall_elapsed: float) -> str:
+        checkpoint_dir = args.output_dir if args.output_dir else "logs"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"{run_id}_{tag}.pt")
+        log = dict(
+            model=checkpoint_state_dict(),
+            code=code,
+            args=args.__dict__,
+            trainer="ar",
+            checkpoint_tag=tag,
+            checkpoint_step=step,
+            timed_training_seconds=timed_elapsed,
+            total_wallclock_seconds=wall_elapsed,
+            total_tokens_processed=tokens_per_step * step,
+            num_parameters=int(num_parameters),
+            non_embedding_parameters=int(non_embedding_parameters),
+        )
+        torch.save(log, checkpoint_path)
+        metadata_path = record_path(checkpoint_path)
+        checkpoint_paths.append(metadata_path)
+        checkpoint_records.append(
+            dict(
+                path=metadata_path,
+                tag=tag,
+                step=step,
+                timed_training_seconds=timed_elapsed,
+                total_wallclock_seconds=wall_elapsed,
+                total_tokens_processed=tokens_per_step * step,
+            )
+        )
+        return checkpoint_path
+
+    if args.checkpoint_steps:
+        checkpoint_steps = {int(item) for item in args.checkpoint_steps.split(",") if item.strip()}
+    else:
+        checkpoint_steps = {int(round(k * args.num_iterations / args.num_checkpoints)) for k in range(1, args.num_checkpoints + 1)}
+    checkpoint_steps = {step for step in checkpoint_steps if 0 < step <= args.num_iterations}
+
+    timings = []
+    timed_training_seconds = 0.0
+    norm = -1.0
+    lossf = None
+    for step in range(args.num_iterations + 1):
+        last_step = step == args.num_iterations
+
+        # Validate at step 0 and once more after the final update.
+        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step) and val_loader is not None:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(args.val_max_steps):
+                    x_val, y_val = val_loader.next_batch()
+                    _, loss = model(x_val, y_val, return_logits=False)
+                    val_loss += loss.item()
+                val_loss /= args.val_max_steps
+            last_val_loss = float(val_loss)
+            print0(f"val loss {val_loss}")
+            if logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write(f"s:{step} tel:{val_loss}\n")
+
+        if last_step:
+            break
+
+        # training section
+        t0 = time.time()
+        model.train()
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+        x, y = train_loader.next_batch()
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        # end of training section, rest is logging etc.
+
+        torch.cuda.synchronize()
+        t1 = time.time()
+        lossf = loss.item()
+        timed_training_seconds += t1 - t0
+        tokens_per_second = ddp_world_size * batch_size * seq_len / (t1 - t0)
+        print0(
+            f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | "
+            f"norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+        )
+        if logfile is not None:
+            with open(logfile, "a") as f:
+                f.write(f"s:{step} trl:{lossf}\n")
+        if step > 0 and step > args.num_iterations - 20:
+            timings.append(t1 - t0)
+        if master_process and (step + 1) in checkpoint_steps and (step + 1) != args.num_iterations:
+            save_checkpoint(
+                f"step{step + 1:06d}",
+                step + 1,
+                timed_training_seconds,
+                time.perf_counter() - overall_t0,
+            )
+
+    timings = timings[-20:] # print avg of last 20 steps to smooth it out
+    avg_last_step_ms = float(np.mean(timings) * 1000) if timings else None
+    if avg_last_step_ms is None:
+        print0("final 0 iters avg: n/a")
+    else:
+        print0(f"final {len(timings)} iters avg: {avg_last_step_ms:.3f}ms")
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    if master_process:
+        final_checkpoint_wallclock_seconds = time.perf_counter() - overall_t0
+        checkpoint_path = save_checkpoint(
+            "final",
+            args.num_iterations,
+            timed_training_seconds,
+            final_checkpoint_wallclock_seconds,
+        )
+        total_wallclock_seconds = time.perf_counter() - overall_t0
+        summary = dict(
+            trainer="ar",
+            run_id=run_id,
+            checkpoint_path=record_path(checkpoint_path),
+            checkpoint_paths=checkpoint_paths,
+            checkpoint_records=checkpoint_records,
+            timed_training_seconds=timed_training_seconds,
+            total_wallclock_seconds=total_wallclock_seconds,
+            avg_last_step_ms=avg_last_step_ms,
+            final_train_loss=lossf,
+            final_val_loss=last_val_loss,
+            tokens_per_step=tokens_per_step,
+            total_tokens_processed=tokens_per_step * args.num_iterations,
+            num_iterations=args.num_iterations,
+            peak_memory_mib=int(torch.cuda.max_memory_allocated() // 1024 // 1024),
+            seed=args.seed,
+            num_parameters=int(num_parameters),
+            non_embedding_parameters=int(non_embedding_parameters),
+        )
+        print0("TRAIN_RESULT " + json.dumps(summary, sort_keys=True))
+
+    destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== speedrun_dlm/train_dlm.py =====
+import argparse
+import glob
+import json
+import math
+import os
+import pickle
+import time
+import uuid
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import torch._inductor.config as inductor_config
+import torch.nn.functional as F
+from torch import nn
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+with open(__file__) as f:
+    code = f.read()
+
+
+DATA_HEADER_INTS = 256
+DATA_FILE_MAGIC = 20240520
+DATA_FILE_VERSION = 1
+DUO_KEEP_PROB_EPS = 1e-6  # DUO keep probs are clamped away from zero
+DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN = 1e-4
+DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX = 20.0
+
+
+@dataclass(frozen=True)
+class ObjectiveSpec:
+    noise_type: str
+    default_noise_schedule: str
+    default_time_conditioning: bool
+    loss_label: str
+    d3pm_default_coeffs: tuple[float, float] | None = None  # (vb, ce) to weight the two D3PM loss terms as vb * L_vb + ce * L_ce
+
+
+DLM_OBJECTIVES = {
+    "subs_mask": ObjectiveSpec("mask", "loglinear", False, "continuous-time mask x0 weighted cross entropy"),
+    # D3PM-mask is CE-dominant here. Official text D3PM used (vb=1, ce=0.01).
+    "d3pm_mask": ObjectiveSpec("mask", "loglinear", True, "discrete-time mask posterior matching", (0.001, 1.0)),
+    "d3pm_uniform": ObjectiveSpec("uniform", "linear", True, "discrete-time uniform posterior matching", (1.0, 0.0)),
+    "sedd_mask": ObjectiveSpec("mask", "loglinear", True, "continuous-time mask score entropy"),
+    "sedd_uniform": ObjectiveSpec("uniform", "geometric", True, "continuous-time uniform score entropy"),
+    "duo_uniform": ObjectiveSpec("uniform", "linear", True, "DUO uniform diffusion loss"),
+}
+
+
+def is_d3pm_objective(objective: str) -> bool:
+    return DLM_OBJECTIVES[objective].d3pm_default_coeffs is not None
+
+
+# =============================================================================
+# MODEL
+# =============================================================================
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.dim = dim
+
+    def forward(self, x0: torch.Tensor) -> torch.Tensor:
+        x = F.layer_norm(x0.float(), (self.dim,))
+        return (x * self.weight[None, None, :]).type_as(x0)
+
+
+def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
+    half = dim // 2
+    exponent = -math.log(max_period) * torch.arange(half, device=timesteps.device, dtype=torch.float32)
+    exponent = exponent / max(half, 1)
+    freqs = torch.exp(exponent)
+    angles = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
+    emb = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+    if dim % 2:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        t_freq = timestep_embedding(timesteps, self.frequency_embedding_size)
+        return self.mlp(t_freq)
+
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def apply_rope(x: torch.Tensor) -> torch.Tensor:
+    head_dim = x.size(-1)
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE requires an even per-head dimension.")
+    seq_len = x.size(-2)
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim)
+    )
+    positions = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+    freqs = positions[:, None] * inv_freq[None, :]
+    angles = torch.cat((freqs, freqs), dim=-1)
+    cos = angles.cos().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+    sin = angles.sin().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+    x1, x2 = x[..., : head_dim // 2], x[..., head_dim // 2 :]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, channels = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        q = q.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_head, channels // self.n_head).transpose(1, 2)
+        q = apply_rope(q)
+        k = apply_rope(k)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, channels)
+        return self.resid_dropout(self.c_proj(y))
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=True)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=True)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.c_proj(F.gelu(self.c_fc(x), approximate="tanh")))
+
+
+class DDiTBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.norm1 = LayerNorm(config.n_embd)
+        self.attn = SelfAttention(config)
+        self.norm2 = LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+        self.adaLN_modulation = nn.Linear(config.cond_dim, 6 * config.n_embd, bias=True)
+        nn.init.zeros_(self.adaLN_modulation.weight)
+        nn.init.zeros_(self.adaLN_modulation.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond).chunk(6, dim=-1)
+        x = x + gate_attn.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_attn, scale_attn))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class DDiTFinalLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.norm_final = LayerNorm(config.n_embd)
+        self.linear = nn.Linear(config.n_embd, config.vocab_size, bias=True)
+        self.adaLN_modulation = nn.Linear(config.cond_dim, 2 * config.n_embd, bias=True)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+        nn.init.zeros_(self.adaLN_modulation.weight)
+        nn.init.zeros_(self.adaLN_modulation.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(cond).chunk(2, dim=-1)
+        return self.linear(modulate(self.norm_final(x), shift, scale))
+
+
+@dataclass
+class DLMConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    cond_dim: int = 128
+    dropout: float = 0.1
+    time_conditioning: bool = False
+
+
+class DiffusionTransformer(nn.Module):
+    # shared non-causal DDiT backbone for every DLM objective
+    def __init__(self, config: DLMConfig):
+        super().__init__()
+        self.config = config
+        self.mask_token_id = config.vocab_size
+        self.transformer = nn.ModuleDict(
+            dict(
+                # One extra input-only row encodes the absorbing mask token. The
+                # output head remains data-vocab-sized and never predicts mask.
+                # Uniform objectives do not index the extra row. Keeping it here
+                # preserves a single shared checkpoint shape across objectives.
+                wte=nn.Embedding(config.vocab_size + 1, config.n_embd),
+                h=nn.ModuleList([DDiTBlock(config) for _ in range(config.n_layer)]),
+            )
+        )
+        self.time_map = TimestepEmbedder(config.cond_dim)
+        self.output_layer = DDiTFinalLayer(config)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        timesteps: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        bsz, seq_len = idx.shape[:2]
+        assert seq_len <= self.config.block_size, (
+            f"Cannot forward sequence of length {seq_len}, block size is only {self.config.block_size}"
+        )
+        if weights is not None:
+            if idx.ndim != 3 or weights.shape != idx.shape:
+                raise ValueError("Weighted embedding inputs require idx and weights with shape (batch, seq, k).")
+            flat_idx = idx.reshape(-1, idx.shape[-1])
+            flat_weights = weights.reshape(-1, weights.shape[-1]).float()
+            tok_emb = F.embedding_bag(
+                flat_idx,
+                self.transformer.wte.weight.float(),
+                per_sample_weights=flat_weights,
+                mode="sum",
+            ).view(bsz, seq_len, -1)
+        elif idx.ndim == 3:
+            if idx.shape[-1] > self.transformer.wte.weight.shape[0]:
+                raise ValueError(
+                    f"Dense distribution input has vocab dimension {idx.shape[-1]}, "
+                    f"but embedding table has {self.transformer.wte.weight.shape[0]} rows."
+                )
+            token_weight = self.transformer.wte.weight[: idx.shape[-1]].float()
+            tok_emb = torch.einsum("blv,ve->ble", F.softmax(idx, dim=-1).float(), token_weight).to(idx.dtype)
+        else:
+            tok_emb = self.transformer.wte(idx)
+        x = tok_emb
+        model_times = timesteps.float() if self.config.time_conditioning else torch.zeros_like(timesteps.float())
+        cond = F.silu(self.time_map(model_times)).type_as(tok_emb)
+        for block in self.transformer.h:
+            x = block(x, cond)
+        return self.output_layer(x, cond)
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, eps=1e-8):
+        return torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas, eps=eps)
+
+
+def model_forward_noisy(model, noisy_tokens: torch.Tensor, time_batch: "TimeBatch", objective: str) -> torch.Tensor:
+    if objective == "duo_uniform":
+        if time_batch.duo_sparse_input_weights is None:
+            if noisy_tokens.ndim == 3:
+                return model(noisy_tokens, time_batch.model_times)
+            raise RuntimeError("DUO forward requires sample_duo_forward_relaxation to populate DUO noisy inputs.")
+        return model(noisy_tokens, time_batch.model_times, weights=time_batch.duo_sparse_input_weights)
+    return model(noisy_tokens, time_batch.model_times)
+
+
+# =============================================================================
+# DATA
+# =============================================================================
+
+
+def _peek_data_shard(filename: str) -> int:
+    with open(filename, "rb") as f:
+        header = np.frombuffer(f.read(DATA_HEADER_INTS * 4), dtype=np.int32)
+    if header[0] != DATA_FILE_MAGIC:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --train_files?")
+        raise SystemExit(1)
+    assert header[1] == DATA_FILE_VERSION, "unsupported version"
+    return int(header[2])
+
+
+def _load_data_shard(filename: str) -> np.ndarray:
+    with open(filename, "rb") as f:
+        header = np.frombuffer(f.read(DATA_HEADER_INTS * 4), dtype=np.int32)
+        assert header[0] == DATA_FILE_MAGIC, "magic number mismatch in the data .bin file"
+        assert header[1] == DATA_FILE_VERSION, "unsupported version"
+        ntok = int(header[2])
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header"
+    return tokens
+
+
+class DistributedDataLoader:
+    def __init__(
+        self,
+        filename_pattern: str,
+        batch_size: int,
+        seq_len: int,
+        process_rank: int,
+        num_processes: int,
+        name: str,
+    ):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.files = sorted(glob.glob(filename_pattern))
+        assert self.files, f"did not find any files matching {filename_pattern}"
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * batch_size * seq_len
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"{name} data: {ntok_total:,} tokens across {len(self.files)} files")
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self):
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self) -> torch.Tensor:
+        batch_size = self.batch_size
+        seq_len = self.seq_len
+        buf = self.tokens[self.current_position : self.current_position + batch_size * seq_len]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = buf.view(batch_size, seq_len)
+        self.current_position += batch_size * seq_len * self.num_processes
+        if self.current_position + (batch_size * seq_len * self.num_processes) > len(self.tokens):
+            self.advance()
+        return x.cuda()
+
+
+# =============================================================================
+# TIME GRIDS AND NOISE SCHEDULES
+# =============================================================================
+
+
+@dataclass
+class TimeBatch:
+    model_times: torch.Tensor  # [batch] scalar sent to the time-conditioning MLP
+    keep_prob: torch.Tensor  # [batch] probability the original token survived to sampled time
+    loss_weight: torch.Tensor | None = None  # [batch] objective-specific rate or CE multiplier
+    prev_keep_prob: torch.Tensor | None = None  # [batch] D3PM keep_prob at step-1, cached instead of passing step+grid into the loss
+    duo_log_noise_ratio: torch.Tensor | None = None  # [batch] DUO continuous relaxation time coordinate
+    duo_discrete_noisy_tokens: torch.Tensor | None = None  # [batch, seq] DUO argmax tokens used by the uniform loss
+    duo_sparse_input_weights: torch.Tensor | None = None  # [batch, seq, top_k] weights for DUO topk-softmax input
+
+
+def keep_prob_from_time(
+    times: torch.Tensor,  # any shape, repo uses [batch] for sampled continuous training times, [T+1] D3PM grids, [S+1] sampler grids
+    noise_schedule: str = "loglinear",
+    eps: float = 1e-6,
+    geometric_noise_level_min: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    geometric_noise_level_max: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+) -> torch.Tensor:
+    # returns keep_prob[...] = chance the original token is still unnoised at times[...]
+    if noise_schedule == "linear":
+        keep_prob = 1.0 - times
+    elif noise_schedule == "loglinear":
+        keep_prob = 1.0 - (1.0 - eps) * times
+    elif noise_schedule == "cosine":
+        offset = 0.008
+        base = math.cos(offset / (1.0 + offset) * math.pi / 2) ** 2
+        keep_prob = torch.cos((times + offset) / (1.0 + offset) * torch.pi / 2).pow(2) / base
+    elif noise_schedule == "geometric":
+        log_total_noise_min = math.log(geometric_noise_level_min)
+        log_total_noise_max = math.log(geometric_noise_level_max)
+        total_noise = torch.exp((1.0 - times) * log_total_noise_min + times * log_total_noise_max)
+        return torch.exp(-total_noise)
+    else:
+        raise ValueError(f"Unsupported noise_schedule={noise_schedule!r}")
+    return keep_prob.clamp_min(eps)
+
+
+def total_noise_rate_from_time(
+    times: torch.Tensor,  # any shape, repo uses [batch] sampled times and [S+1] SEDD sampler grids
+    noise_schedule: str,
+    eps: float = 1e-6,
+    geometric_noise_level_min: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    geometric_noise_level_max: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+) -> torch.Tensor:
+    # returns total_noise_rate[...] = d[-log keep_prob(t)]/dt at times[...]
+    if noise_schedule == "linear":
+        return 1.0 / (1.0 - times).clamp_min(eps)
+    if noise_schedule == "loglinear":
+        return (1.0 - eps) / (1.0 - (1.0 - eps) * times)
+    if noise_schedule == "cosine":
+        offset = 0.008
+        base = math.cos(offset / (1.0 + offset) * math.pi / 2) ** 2
+        angle = (times + offset) / (1.0 + offset) * math.pi
+        keep_prime = -(torch.sin(angle) * math.pi / (2.0 * (1.0 + offset) * base))
+        keep_prob = keep_prob_from_time(times, noise_schedule, eps)
+        return -keep_prime / keep_prob.clamp_min(eps)
+    if noise_schedule == "geometric":
+        log_total_noise_min = math.log(geometric_noise_level_min)
+        log_total_noise_max = math.log(geometric_noise_level_max)
+        total_noise = torch.exp((1.0 - times) * log_total_noise_min + times * log_total_noise_max)
+        return total_noise * (math.log(geometric_noise_level_max) - math.log(geometric_noise_level_min))
+    raise ValueError(f"Unsupported noise_schedule={noise_schedule!r}")
+
+
+def sample_time(
+    batch_size: int,
+    objective: str,
+    noise_schedule: str,
+    continuous_time_eps: float,
+    antithetic_sampling: bool,
+    device: torch.device,
+    keep_prob_grid: torch.Tensor | None = None,  # [T+1] only for D3PM
+    num_diffusion_steps: int = 0,
+    geometric_noise_level_min: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    geometric_noise_level_max: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+    duo_log_noise_ratio_min: float = -3.55,
+    duo_log_noise_ratio_max: float = -1.85,
+    duo_keep_prob_table: dict[str, torch.Tensor | float | int] | None = None,
+    duo_vocab_size: int | None = None,
+) -> TimeBatch:
+    # Each training example samples one time for the chosen objective's loss.
+    # The training T is only used by D3PM: it samples an integer step in {1..T}.
+    # Continuous-time objectives sample one scalar t in [eps, 1]. Text samplers
+    # build their S-step grids in sample_text.py, not from training T.
+    if objective in {"d3pm_mask", "d3pm_uniform"}:
+        if keep_prob_grid is None:
+            raise RuntimeError("D3PM training requires its T-step keep-probability grid.")
+        steps = torch.randint(1, num_diffusion_steps + 1, (batch_size,), device=device)
+        return TimeBatch(
+            model_times=steps.float() / num_diffusion_steps,
+            keep_prob=keep_prob_grid[steps],
+            prev_keep_prob=keep_prob_grid[steps - 1],
+        )
+
+    if antithetic_sampling:
+        jitter = torch.rand(batch_size, device=device)
+        offsets = torch.arange(batch_size, device=device, dtype=torch.float32) / batch_size
+        unit_times = torch.remainder(jitter / batch_size + offsets, 1.0)
+    else:
+        unit_times = torch.rand(batch_size, device=device)
+    times = continuous_time_eps + (1.0 - continuous_time_eps) * unit_times
+
+    if objective == "duo_uniform":
+        if duo_keep_prob_table is None or duo_vocab_size is None:
+            raise RuntimeError("DUO time sampling requires the keep-probability table and vocab size.")
+        log_noise_ratio = duo_log_noise_ratio_min + times * (duo_log_noise_ratio_max - duo_log_noise_ratio_min)
+        duo_keep_prob, duo_keep_prob_rate = duo_keep_prob_and_rate_from_table(
+            log_noise_ratio,
+            duo_keep_prob_table,
+            vocab_size=duo_vocab_size,
+            log_noise_ratio_min=duo_log_noise_ratio_min,
+            log_noise_ratio_max=duo_log_noise_ratio_max,
+        )
+        return TimeBatch(
+            model_times=-torch.log(duo_keep_prob.clamp_min(DUO_KEEP_PROB_EPS)),
+            keep_prob=duo_keep_prob,
+            loss_weight=duo_keep_prob_rate,
+            duo_log_noise_ratio=log_noise_ratio,
+        )
+
+    keep_prob = keep_prob_from_time(
+        times,
+        noise_schedule,
+        continuous_time_eps,
+        geometric_noise_level_min,
+        geometric_noise_level_max,
+    )
+    total_noise_rate = total_noise_rate_from_time(
+        times,
+        noise_schedule,
+        continuous_time_eps,
+        geometric_noise_level_min,
+        geometric_noise_level_max,
+    )
+    model_times = -torch.log(keep_prob)
+    if objective == "subs_mask":
+        return TimeBatch(
+            model_times=model_times,
+            keep_prob=keep_prob,
+            loss_weight=total_noise_rate * keep_prob / (1.0 - keep_prob),
+        )
+    if objective in {"sedd_mask", "sedd_uniform"}:
+        return TimeBatch(
+            model_times=model_times,
+            keep_prob=keep_prob,
+            loss_weight=total_noise_rate,
+        )
+    raise ValueError(f"Unsupported objective={objective!r}")
+
+
+# =============================================================================
+# FORWARD CORRUPTION
+# =============================================================================
+
+
+def sample_mask_forward_marginal(
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    keep_prob: torch.Tensor,  # [batch]
+    mask_token_id: int,
+) -> torch.Tensor:
+    keep_mask = torch.rand_like(clean_tokens, dtype=torch.float32) < keep_prob.unsqueeze(1)
+    noisy_tokens = clean_tokens.clone()
+    noisy_tokens[~keep_mask] = mask_token_id
+    return noisy_tokens
+
+
+def sample_uniform_forward_marginal(
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    keep_prob: torch.Tensor,  # [batch]
+    vocab_size: int,
+) -> torch.Tensor:
+    keep_mask = torch.rand_like(clean_tokens, dtype=torch.float32) < keep_prob.unsqueeze(1)
+    random_tokens = torch.randint(vocab_size, clean_tokens.shape, device=clean_tokens.device)
+    return torch.where(keep_mask, clean_tokens, random_tokens)
+
+
+def load_duo_keep_prob_table(path: str, device: str) -> dict[str, torch.Tensor | float | int]:
+    if not path:
+        raise ValueError(
+            "objective=duo_uniform requires --duo_keep_prob_table_path from the official DUO keep probability table."
+        )
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    # DUO table stores the gaussian argmax map so training does not integrate it each step
+    required = {"vocab_size", "gamma_min", "gamma_max", "num_points", "pt"}
+    missing = required.difference(data)
+    if missing:
+        raise ValueError(f"DUO keep-probability table is missing keys: {sorted(missing)}")
+    return {
+        "vocab_size": int(data["vocab_size"]),
+        "log_noise_ratio_min": float(data["gamma_min"]),
+        "log_noise_ratio_max": float(data["gamma_max"]),
+        "num_points": int(data["num_points"]),
+        "uniform_state_prob": torch.as_tensor(data["pt"], device=device),
+    }
+
+
+def duo_keep_prob_from_table(
+    log_noise_ratio: torch.Tensor,  # [batch] DUO continuous relaxation time coordinate
+    table: dict[str, torch.Tensor | float | int],
+    vocab_size: int,
+) -> torch.Tensor:
+    # DUO table gives clean argmax prob convert to uniform keep prob
+    log_noise_ratio_min = float(table["log_noise_ratio_min"])
+    log_noise_ratio_max = float(table["log_noise_ratio_max"])
+    num_points = int(table["num_points"])
+    log_noise_ratio = torch.clip(log_noise_ratio, log_noise_ratio_min, log_noise_ratio_max)
+    indices = torch.round(
+        (num_points - 1) * (log_noise_ratio - log_noise_ratio_min) / (log_noise_ratio_max - log_noise_ratio_min)
+    ).long()
+    uniform_state_prob = table["uniform_state_prob"][indices]
+    return (vocab_size * uniform_state_prob - 1) / (vocab_size - 1)
+
+
+def duo_keep_prob_and_rate_from_table(
+    log_noise_ratio: torch.Tensor,  # [batch] DUO continuous relaxation time coordinate
+    table: dict[str, torch.Tensor | float | int],
+    vocab_size: int,
+    log_noise_ratio_min: float,
+    log_noise_ratio_max: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keep_prob = duo_keep_prob_from_table(log_noise_ratio, table, vocab_size)
+    log_noise_ratio_span = log_noise_ratio_max - log_noise_ratio_min
+    finite_difference_steps = 1000
+    keep_prob_rate = log_noise_ratio_span * finite_difference_steps * (
+        duo_keep_prob_from_table(log_noise_ratio + 1 / finite_difference_steps, table, vocab_size)
+        - keep_prob
+    )
+    return keep_prob, keep_prob_rate
+
+
+def duo_input_inverse_temperature(
+    step: int,
+    temperature_log10_start: float,
+    temperature_log10_end: float,
+    curriculum_start: int,
+    curriculum_end: int,
+) -> float:
+    # DUO argmax of gaussian latents has uniform state marginals
+    # training feeds softmax(latents / temp) and lowers temp toward argmax
+    if step < curriculum_start:
+        temperature_log10 = temperature_log10_start
+    elif step < curriculum_end:
+        frac = (step - curriculum_start) / max(curriculum_end - curriculum_start, 1)
+        temperature_log10 = temperature_log10_start + frac * (temperature_log10_end - temperature_log10_start)
+    else:
+        temperature_log10 = -10.0  # after the curriculum, DUO uses a near-argmax softmax
+    return 10 ** (-temperature_log10)
+
+
+def _sample_k_int(bs: int, length: int, k: int, max_value: int, device: torch.device) -> torch.Tensor:
+    # vectorized partial shuffle: k distinct ids from range(max_value) for each batch/position
+    out = torch.empty(size=(bs, length, k), dtype=torch.int64, device=device)
+    for t, i in enumerate(range(max_value - k, max_value)):
+        j = torch.randint(0, i + 1, size=(bs, length), device=device)
+        if t > 0:
+            duplicate = (out[..., :t] == j[..., None]).any(dim=-1)
+            out[..., t] = torch.where(duplicate, i, j)
+        else:
+            out[..., 0] = j
+    return out
+
+
+def _sample_topk_gaussian(
+    N: int,
+    noise_scale: torch.Tensor,  # [batch]
+    length: int,
+    k: int,
+) -> torch.Tensor:
+    # top-k order statistics for N iid zero-mean Gaussian competitors
+    batch = noise_scale.shape[0]
+    device = noise_scale.device
+    dtype = noise_scale.dtype
+    log_u = torch.log(torch.rand(batch, length, k, device=device, dtype=dtype))
+    divisors = torch.arange(N, N - k, -1, device=device, dtype=dtype)
+    log_rj = log_u / divisors
+    uniforms = torch.exp(torch.cumsum(log_rj, dim=-1))
+    return torch.special.ndtri(uniforms) * noise_scale[:, None, None]
+
+
+def _sample_topk_and_extra(
+    N: int,
+    clean_scale: torch.Tensor,
+    noise_scale: torch.Tensor,
+    length: int,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    top_k_others = _sample_topk_gaussian(N - 1, noise_scale, length, k)
+    extra = clean_scale[:, None] + torch.randn(size=(clean_scale.shape[0], length), device=clean_scale.device) * noise_scale[:, None]
+    min_values = top_k_others[:, :, -1]
+    is_extra_in_topk = extra > min_values
+    top_k_others[:, :, -1][is_extra_in_topk] = extra[is_extra_in_topk]
+    return extra, top_k_others, is_extra_in_topk
+
+
+def _log_mean_exp_trunc_normal(cutoff: torch.Tensor, normal_std: torch.Tensor) -> torch.Tensor:
+    log_num = torch.special.log_ndtr((cutoff - normal_std**2) / normal_std)
+    log_den = torch.special.log_ndtr(cutoff / normal_std)
+    return normal_std**2 / 2.0 + log_num - log_den
+
+
+def sample_duo_tempered_softmax_topk(
+    extra_index: torch.Tensor,  # [batch, seq] clean token ids
+    clean_scale: torch.Tensor,  # [batch] clean-token Gaussian mean scale
+    noise_scale: torch.Tensor,  # [batch] Gaussian noise std
+    length: int,
+    k: int,
+    vocab_size: int,
+    inverse_temperature: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # target: softmax(inverse_temperature * noisy_vocab_vector) without materializing all vocab columns
+    # sample the top-k non-clean competitors, add the clean token candidate, and integrate the remaining tail
+    # DUO topk gaussian relaxation
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/utils.py#L529-L655
+    if k < 2 or k >= vocab_size:
+        raise ValueError(f"DUO topk requires 2 <= k < vocab_size, got k={k}, vocab_size={vocab_size}.")
+    clean_scale = clean_scale.to(torch.float64)
+    noise_scale = noise_scale.to(torch.float64)
+    extra, top_k, is_extra_in_topk = _sample_topk_and_extra(vocab_size, clean_scale, noise_scale, length, k)
+    min_rv = torch.where(is_extra_in_topk, top_k[:, :, -2], top_k[:, :, -1])
+    scaled_noise_std = noise_scale[:, None] * inverse_temperature
+    scaled_c = min_rv * inverse_temperature
+    log_mu = _log_mean_exp_trunc_normal(scaled_c, scaled_noise_std)
+    log_topk = top_k * inverse_temperature
+    count = torch.where(is_extra_in_topk, vocab_size - k, vocab_size - k - 1).to(log_mu.dtype)
+    log_tail = torch.log(count) + log_mu
+    log_extra = extra * inverse_temperature
+    extra_not_in_topk = ~is_extra_in_topk
+    log_extra_masked = torch.full_like(log_tail, float("-inf"))
+    log_extra_masked[extra_not_in_topk] = log_extra[extra_not_in_topk]
+    log_contribs = torch.cat([log_topk, log_tail[..., None], log_extra_masked[..., None]], dim=-1)
+    log_denom = torch.logsumexp(log_contribs, dim=-1, keepdim=True)
+    softmax_approx = torch.exp(log_topk - log_denom)
+    normalizer = softmax_approx.sum(dim=-1, keepdim=True)
+    zero_sum = normalizer == 0.0
+    softmax_approx = torch.where(zero_sum, 0.0, softmax_approx)
+    softmax_approx[..., 0][zero_sum[..., 0]] = 1.0
+    indices = _sample_k_int(clean_scale.shape[0], length, k, vocab_size - 1, device=clean_scale.device)
+    indices[indices >= extra_index[..., None]] += 1
+    indices[..., -1][is_extra_in_topk] = extra_index[is_extra_in_topk]
+    xt_usdm = torch.where(is_extra_in_topk, extra_index, indices[..., 0])
+    return softmax_approx, indices, xt_usdm
+
+
+def sample_duo_forward_relaxation(
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    curriculum_mode: str,
+    top_k: int,
+    inverse_temperature: float,
+    vocab_size: int,
+) -> torch.Tensor:
+    # DUO softmax and topk curricula
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L582-L636
+    clean_scale = torch.sigmoid(-time_batch.duo_log_noise_ratio).sqrt()
+    noise_scale = torch.sigmoid(time_batch.duo_log_noise_ratio).sqrt()
+    if curriculum_mode == "softmax":
+        # DUO replaces exact argmax input with a full vocab softmax
+        # DUO softmax builds dense batch seq vocab tensors so memory gets huge
+        x0_one_hot = F.one_hot(clean_tokens, vocab_size).to(torch.float32)
+        xt = clean_scale[:, None, None] * x0_one_hot + noise_scale[:, None, None] * torch.randn_like(x0_one_hot)
+        xt = xt * inverse_temperature
+        time_batch.duo_discrete_noisy_tokens = xt.argmax(-1)
+        time_batch.duo_sparse_input_weights = None
+        return xt
+    if curriculum_mode != "topk":
+        raise NotImplementedError(f"Unsupported DUO curriculum mode: {curriculum_mode!r}.")
+    # DUO topk keeps sparse softmax weights instead of all vocab columns
+    # DUO topk stores batch seq k weights but logits and loss still use vocab
+    weights, indices, xt_usdm = sample_duo_tempered_softmax_topk(
+        extra_index=clean_tokens,
+        clean_scale=clean_scale,
+        noise_scale=noise_scale,
+        length=clean_tokens.shape[1],
+        k=top_k,
+        vocab_size=vocab_size,
+        inverse_temperature=inverse_temperature,
+    )
+    time_batch.duo_discrete_noisy_tokens = xt_usdm
+    time_batch.duo_sparse_input_weights = weights
+    return indices
+
+
+def sample_forward_marginal(
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    objective: str,
+    noise_type: str,
+    mask_token_id: int,
+    vocab_size: int,
+    duo_curriculum_mode: str = "softmax",
+    duo_top_k: int = 32,
+    duo_input_inverse_temperature: float = 1.0,
+) -> torch.Tensor:
+    if objective == "duo_uniform":
+        return sample_duo_forward_relaxation(
+            clean_tokens,
+            time_batch,
+            curriculum_mode=duo_curriculum_mode,
+            top_k=duo_top_k,
+            inverse_temperature=duo_input_inverse_temperature,
+            vocab_size=vocab_size,
+        )
+    if noise_type == "mask":
+        return sample_mask_forward_marginal(clean_tokens, time_batch.keep_prob, mask_token_id)
+    if noise_type == "uniform":
+        return sample_uniform_forward_marginal(clean_tokens, time_batch.keep_prob, vocab_size)
+    raise ValueError(f"Unsupported noise_type={noise_type!r}")
+
+
+# =============================================================================
+# SUBS MASK LOSS
+# =============================================================================
+
+# SUBS mask and absorbing-state D3PM share the same mask-corruption family.
+# SUBS uses a continuous-time x0 CE weight. Absorbing D3PM's posterior KL
+# collapses to the same masked x0 CE with a discrete posterior weight.
+
+
+def x0_weighted_ce(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    token_weights: torch.Tensor | None = None,  # [batch] or [batch, seq]
+    mask: torch.Tensor | None = None,  # [batch, seq]
+    normalization: str = "token_mean",
+) -> torch.Tensor:
+    """Weighted x0 CE: weights set importance, mask excludes padding (all tokens by default)."""
+    logprobs = F.log_softmax(raw_logits.float(), dim=-1)
+    nll = -logprobs.gather(-1, clean_tokens.unsqueeze(-1)).squeeze(-1)
+    if token_weights is None:
+        token_weights = torch.ones_like(nll)
+    else:
+        token_weights = token_weights.to(device=nll.device, dtype=nll.dtype)
+        if token_weights.ndim == 1 and token_weights.shape[0] == nll.shape[0]:
+            token_weights = token_weights.unsqueeze(1)
+    if mask is None:
+        mask = torch.ones_like(nll)
+    else:
+        mask = mask.to(device=nll.device, dtype=nll.dtype)
+    weighted_mask = token_weights * mask
+    numerator = (nll * weighted_mask).sum()
+    if normalization == "token_mean":
+        return numerator / mask.sum().clamp_min(1.0)
+    if normalization == "masked_weight_mean":
+        return numerator / weighted_mask.sum().clamp_min(1.0)
+    raise ValueError(f"Unsupported x0 CE normalization: {normalization!r}")
+
+
+def subs_mask_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    mask_token_id: int,
+    normalization: str,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # SUBS mask-only weighted CE:
+    # https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/diffusion.py#L847-L894
+    token_weights = noisy_tokens.eq(mask_token_id) * time_batch.loss_weight.unsqueeze(1)
+    loss = x0_weighted_ce(
+        raw_logits,
+        clean_tokens,
+        token_weights,
+        mask=attention_mask,
+        normalization=normalization,
+    )
+    return loss, {"ce_loss": float(loss.detach().item())}
+
+
+# =============================================================================
+# D3PM POSTERIOR-MATCHING LOSSES
+# =============================================================================
+
+
+def d3pm_reverse_posterior_probs(
+    x0: torch.Tensor,  # [batch, seq] tokens or [batch, seq, vocab] logits
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    noise_type: str,
+    vocab_size: int,
+    mask_token_id: int,
+    x0_is_logits: bool,
+) -> torch.Tensor:
+    # Dense D3PM posterior q(x_{t-1} | x_t, x0):
+    # https://github.com/google-research/google-research/blob/1fa17414f56c3703d5adb3818338b6e35e0fd550/d3pm/text/diffusion.py#L303-L428
+    # https://github.com/google-research/google-research/blob/1fa17414f56c3703d5adb3818338b6e35e0fd550/d3pm/text/diffusion.py#L2431-L2514
+    if time_batch.prev_keep_prob is None:
+        raise RuntimeError("D3PM posterior requires the previous grid keep_prob.")
+    posterior_dtype = x0.dtype if x0_is_logits and x0.is_floating_point() else time_batch.keep_prob.dtype
+    if time_batch.keep_prob.device.type == "cuda" and posterior_dtype == torch.float32:
+        posterior_dtype = torch.bfloat16
+    tiny = torch.finfo(posterior_dtype).tiny
+    prev_keep_prob = time_batch.prev_keep_prob.view(-1, 1, 1).to(dtype=posterior_dtype)
+    keep_prob = time_batch.keep_prob.view(-1, 1, 1).to(dtype=posterior_dtype)
+    one = keep_prob.new_tensor(1.0)
+    beta_t = (one - keep_prob / prev_keep_prob.clamp_min(tiny)).clamp(1e-6, 0.999)
+
+    if noise_type == "uniform":
+        inv_support = keep_prob.new_tensor(1.0 / vocab_size)
+        if x0_is_logits:
+            x0_probs = torch.softmax(x0.to(dtype=posterior_dtype), dim=-1)
+        else:
+            x0_probs = F.one_hot(x0, num_classes=vocab_size).to(dtype=posterior_dtype)
+        prev_probs = prev_keep_prob * x0_probs + (one - prev_keep_prob) * inv_support
+        base = beta_t * inv_support
+        xt_prev_probs = prev_probs.gather(-1, noisy_tokens.unsqueeze(-1))
+        posterior = prev_probs * base
+        posterior.scatter_add_(-1, noisy_tokens.unsqueeze(-1), (one - beta_t) * xt_prev_probs)
+        denom = (base + (one - beta_t) * xt_prev_probs).clamp_min(tiny)
+        return posterior / denom
+
+    if noise_type == "mask":
+        support_size = vocab_size + 1
+        if x0_is_logits:
+            x0_probs = torch.softmax(x0.to(dtype=posterior_dtype), dim=-1)
+            x0_probs = torch.cat(
+                [x0_probs, torch.zeros(*x0_probs.shape[:2], 1, device=x0_probs.device, dtype=x0_probs.dtype)],
+                dim=-1,
+            )
+        else:
+            x0_probs = F.one_hot(x0, num_classes=support_size).to(dtype=posterior_dtype)
+        mask_probs = F.one_hot(torch.full_like(noisy_tokens, mask_token_id), num_classes=support_size).to(dtype=posterior_dtype)
+        prev_probs = prev_keep_prob * x0_probs + (one - prev_keep_prob) * mask_probs
+        xt_onehot = F.one_hot(noisy_tokens, num_classes=support_size).to(dtype=posterior_dtype)
+        xt_is_mask = noisy_tokens.eq(mask_token_id).unsqueeze(-1).to(dtype=posterior_dtype)
+        step_probs = (one - beta_t) * xt_onehot + beta_t * xt_is_mask
+        unnorm = prev_probs * step_probs
+        return unnorm / unnorm.sum(dim=-1, keepdim=True).clamp_min(tiny)
+
+    raise ValueError(f"Unsupported noise_type={noise_type!r}")
+
+
+def d3pm_vb_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    noise_type: str,
+    mask_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    pred_posterior = d3pm_reverse_posterior_probs(
+        raw_logits,
+        noisy_tokens,
+        time_batch,
+        noise_type=noise_type,
+        vocab_size=raw_logits.size(-1),
+        mask_token_id=mask_token_id,
+        x0_is_logits=True,
+    )
+    tiny = torch.finfo(pred_posterior.dtype).tiny
+    pred_log = pred_posterior.clamp_min(tiny).log()
+    true_posterior = d3pm_reverse_posterior_probs(
+        clean_tokens,
+        noisy_tokens,
+        time_batch,
+        noise_type=noise_type,
+        vocab_size=raw_logits.size(-1),
+        mask_token_id=mask_token_id,
+        x0_is_logits=False,
+    )
+    per_token_kl = (true_posterior * (true_posterior.clamp_min(tiny).log() - pred_log)).sum(dim=-1)
+    if attention_mask is None:
+        return per_token_kl.mean()
+    attention_mask = attention_mask.to(device=per_token_kl.device, dtype=per_token_kl.dtype)
+    return (per_token_kl * attention_mask).sum() / attention_mask.sum().clamp_min(1.0)
+
+
+def d3pm_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    noise_type: str,
+    vb_coeff: float,
+    ce_coeff: float,
+    mask_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if noise_type == "mask":  # For mask diffusion, the VB term simplifies to weighted CE, so we call x0_weighted_ce to highlight this shared backbone with SUBS mask
+        if time_batch.prev_keep_prob is None:
+            raise RuntimeError("D3PM mask VB requires time_batch.prev_keep_prob.")
+        posterior_weight = (time_batch.prev_keep_prob - time_batch.keep_prob) / (1.0 - time_batch.keep_prob)
+        token_weights = noisy_tokens.eq(mask_token_id) * posterior_weight.clamp_min(0.0).unsqueeze(1)
+        vb_loss = x0_weighted_ce(
+            raw_logits,
+            clean_tokens,
+            token_weights,
+            mask=attention_mask,
+        )
+    else:  # For non-mask D3PM (currently uniform), compute the full KL
+        vb_loss = d3pm_vb_loss(
+            raw_logits,
+            clean_tokens,
+            noisy_tokens,
+            time_batch,
+            noise_type=noise_type,
+            mask_token_id=mask_token_id,
+            attention_mask=attention_mask,
+        )
+    ce_loss = x0_weighted_ce(raw_logits, clean_tokens, mask=attention_mask)
+    loss = vb_coeff * vb_loss + ce_coeff * ce_loss
+    return loss, {"ce_loss": float(ce_loss.detach().item()), "vb_loss": float(vb_loss.detach().item())}
+
+
+# =============================================================================
+# SEDD SCORE-ENTROPY LOSSES
+# =============================================================================
+
+
+def sedd_mask_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    mask_token_id: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    tiny = torch.finfo(time_batch.keep_prob.dtype).tiny
+    keep_prob = time_batch.keep_prob.clamp_min(tiny)
+    noise_prob = (1.0 - keep_prob).clamp_min(tiny)
+    log_noise_to_keep = noise_prob.log() - keep_prob.log()
+    log_scores = raw_logits.float() - log_noise_to_keep[:, None, None] - math.log(raw_logits.shape[-1])
+    mask_column = torch.zeros(*log_scores.shape[:2], 1, device=log_scores.device, dtype=log_scores.dtype)
+    log_scores = torch.cat([log_scores, mask_column], dim=-1)
+    log_scores = torch.scatter(log_scores, -1, noisy_tokens.unsqueeze(-1), torch.zeros_like(log_scores[..., :1]))
+    masked_positions = noisy_tokens.eq(mask_token_id)
+    entropy = torch.zeros_like(noisy_tokens, dtype=log_scores.dtype)
+    if masked_positions.any():
+        keep_to_noise = (keep_prob / noise_prob).unsqueeze(1).expand_as(noisy_tokens)
+        ratio = keep_to_noise[masked_positions]
+        masked_scores = log_scores[masked_positions]
+        target_tokens = clean_tokens[masked_positions]
+        neg_term = ratio * masked_scores.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+        pos_term = masked_scores[:, :-1].exp().sum(dim=-1)
+        const = ratio * (ratio.log() - 1.0)
+        entropy[masked_positions] = pos_term - neg_term + const
+    loss = (time_batch.loss_weight.unsqueeze(1) * entropy).sum(dim=-1).mean()
+    return loss, {"score_entropy": float(loss.detach().item())}
+
+
+def sedd_uniform_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    time_batch: TimeBatch,
+    vocab_size: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # Complete-state score entropy:
+    # https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/graph_lib.py#L116-L189
+    log_scores = raw_logits.float()
+    log_scores = torch.scatter(log_scores, -1, noisy_tokens.unsqueeze(-1), torch.zeros_like(log_scores[..., :1]))
+    tiny = torch.finfo(time_batch.keep_prob.dtype).tiny
+    keep_prob = time_batch.keep_prob.clamp_min(tiny).unsqueeze(1)
+    noise_prob = (1.0 - time_batch.keep_prob).clamp_min(tiny).unsqueeze(1)
+    noise_to_keep = noise_prob / keep_prob
+    ratio = noise_to_keep / (noise_to_keep + vocab_size)
+    clean_score = log_scores.gather(-1, clean_tokens.unsqueeze(-1)).squeeze(-1)
+    neg_term = log_scores.mean(dim=-1)
+    same = noisy_tokens.eq(clean_tokens)
+    neg_term = torch.where(same, ratio * neg_term, clean_score * keep_prob / noise_prob + neg_term)
+    ratio_for_log = ratio.clamp_min(torch.finfo(ratio.dtype).tiny)
+    const_same = (vocab_size - 1) / vocab_size * ratio * (ratio_for_log.log() - 1.0)
+    const_diff = ((-ratio_for_log.log() - 1.0) / ratio_for_log - (vocab_size - 2)) / vocab_size
+    const = torch.where(same, const_same, const_diff)
+    pos_term = log_scores.exp().mean(dim=-1) - (1.0 / vocab_size)
+    entropy = pos_term - neg_term + const
+    loss = (time_batch.loss_weight.unsqueeze(1) * entropy).sum(dim=-1).mean()
+    return loss, {"score_entropy": float(loss.detach().item())}
+
+
+# =============================================================================
+# DUO UNIFORM LOSSES
+# =============================================================================
+
+
+def duo_uniform_nll_per_token(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    noisy_tokens: torch.Tensor,  # [batch, seq]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    keep_prob: torch.Tensor,  # [batch, 1]
+    keep_prob_rate: torch.Tensor,  # [batch, 1]
+    vocab_size: int,
+) -> torch.Tensor:
+    # not plain ce because DUO scores the full noisy marginal
+    # this is the continuous time uniform state nll using keep prob and its rate
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L337-L372
+    pred_clean_probs = F.softmax(raw_logits.float(), dim=-1)
+    scaled_pred_noisy_probs = (
+        vocab_size * keep_prob[:, :, None] * pred_clean_probs
+        + 1
+        - keep_prob[:, :, None]
+    )
+    same_token = (clean_tokens == noisy_tokens).float()
+    different_token = 1 - same_token
+
+    scaled_true_noisy_prob = (1 - keep_prob) + vocab_size * keep_prob * same_token
+    pred_noisy_at_noisy = torch.gather(scaled_pred_noisy_probs, -1, noisy_tokens.unsqueeze(-1)).squeeze(-1)
+    pred_noisy_at_clean = torch.gather(scaled_pred_noisy_probs, -1, clean_tokens.unsqueeze(-1)).squeeze(-1)
+    first_term = vocab_size * (1 / scaled_true_noisy_prob - 1 / pred_noisy_at_noisy)
+
+    uniform_floor = (1 - keep_prob) / (vocab_size * keep_prob + 1 - keep_prob)
+    second_term_weight = same_token * uniform_floor + different_token
+    second_term_offset = (
+        (vocab_size - 1) * uniform_floor * same_token
+        - (1 / uniform_floor) * different_token
+    ) * uniform_floor.log()
+    second_term_model = -second_term_weight * (
+        scaled_pred_noisy_probs.log().sum(-1) - vocab_size * pred_noisy_at_noisy.log()
+    )
+    second_term_model = (
+        second_term_model
+        - vocab_size
+        * keep_prob
+        / (1 - keep_prob)
+        * (pred_noisy_at_clean.log() - pred_noisy_at_noisy.log())
+        * different_token
+    )
+    second_term = second_term_model + second_term_offset
+    loss_scale = keep_prob_rate / (vocab_size * keep_prob)
+    return loss_scale * (first_term - second_term)
+
+
+def duo_uniform_loss(
+    raw_logits: torch.Tensor,
+    clean_tokens: torch.Tensor,
+    time_batch: TimeBatch,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if time_batch.duo_discrete_noisy_tokens is None:
+        raise RuntimeError("DUO loss requires sample_duo_forward_relaxation to populate discrete noisy tokens.")
+    keep_prob = time_batch.keep_prob.unsqueeze(-1)
+    keep_prob_rate = time_batch.loss_weight.unsqueeze(-1)
+    loss_matrix = duo_uniform_nll_per_token(
+        raw_logits=raw_logits,
+        noisy_tokens=time_batch.duo_discrete_noisy_tokens,
+        clean_tokens=clean_tokens,
+        keep_prob=keep_prob,
+        keep_prob_rate=keep_prob_rate,
+        vocab_size=raw_logits.size(-1),
+    )
+    loss = loss_matrix.mean()
+    return loss, {"duo_usdm_loss": float(loss.detach().item())}
+
+
+# =============================================================================
+# OBJECTIVE LOSS ROUTING
+# =============================================================================
+
+
+def compute_dlm_loss(
+    raw_logits: torch.Tensor,  # [batch, seq, vocab]
+    clean_tokens: torch.Tensor,  # [batch, seq]
+    noisy_tokens: torch.Tensor,  # [batch, seq] or DUO sparse ids
+    time_batch: TimeBatch,
+    objective: str,
+    noise_type: str,
+    mask_token_id: int,
+    subs_mask_normalization: str = "token_mean",
+    d3pm_vb_coeff: float = 1.0,
+    d3pm_ce_coeff: float = 0.0,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if objective == "subs_mask":
+        return subs_mask_loss(
+            raw_logits,
+            clean_tokens,
+            noisy_tokens,
+            time_batch,
+            mask_token_id,
+            subs_mask_normalization,
+            attention_mask=attention_mask,
+        )
+    if objective in {"d3pm_mask", "d3pm_uniform"}:
+        return d3pm_loss(
+            raw_logits,
+            clean_tokens,
+            noisy_tokens,
+            time_batch,
+            noise_type=noise_type,
+            vb_coeff=d3pm_vb_coeff,
+            ce_coeff=d3pm_ce_coeff,
+            mask_token_id=mask_token_id,
+            attention_mask=attention_mask,
+        )
+    if objective == "sedd_mask":
+        return sedd_mask_loss(raw_logits, clean_tokens, noisy_tokens, time_batch, mask_token_id)
+    if objective == "sedd_uniform":
+        return sedd_uniform_loss(raw_logits, clean_tokens, noisy_tokens, time_batch, raw_logits.size(-1))
+    if objective == "duo_uniform":
+        return duo_uniform_loss(raw_logits, clean_tokens, time_batch)
+    raise ValueError(f"Unsupported objective={objective!r}")
+
+
+def print0(*args, **kwargs):
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*args, **kwargs)
+
+
+def objective_summary_lines(args) -> list[str]:
+    spec = DLM_OBJECTIVES[args.objective]
+    lines = [
+        f"objective: {args.objective} ({args.noise_type} corruption)",
+        f"loss: {spec.loss_label}",
+    ]
+    if is_d3pm_objective(args.objective):
+        lines.append(f"time grid: discrete {args.num_diffusion_steps} steps")
+        lines.append(f"d3pm_coeffs: vb={args.d3pm_vb_coeff:g}, ce={args.d3pm_ce_coeff:g}")
+    else:
+        lines.append(f"time grid: continuous eps={args.continuous_time_eps:g}")
+
+    if args.objective == "subs_mask":
+        lines.append(f"subs_mask_normalization: {args.subs_mask_normalization}")
+    if args.objective.startswith("sedd_"):
+        state_space = "mask" if args.objective == "sedd_mask" else "uniform"
+        lines.append(f"sedd_state_space: {state_space}")
+    if args.objective == "duo_uniform":
+        lines.append(
+            "duo_curriculum: "
+            f"{args.duo_curriculum_mode}, log_noise_ratio=[{args.duo_log_noise_ratio_min:g}, {args.duo_log_noise_ratio_max:g}], "
+            f"softmax_temperature_log10=[{args.duo_softmax_temperature_log10_start:g}, {args.duo_softmax_temperature_log10_end:g}], "
+            f"top_k={args.duo_top_k}"
+        )
+    if args.noise_schedule == "geometric":
+        lines.append(f"noise_schedule: geometric total_noise=[{args.geometric_noise_level_min:g}, {args.geometric_noise_level_max:g}]")
+    else:
+        lines.append(f"noise_schedule: {args.noise_schedule}")
+    return lines
+
+
+def objective_summary_fields(args) -> dict:
+    # structured TRAIN_RESULT fields; objective_summary_lines is only for humans
+    fields = {
+        "noise_type": args.noise_type,
+        "objective": args.objective,
+        "noise_schedule": args.noise_schedule,
+        "recipe": args.objective,
+    }
+    if is_d3pm_objective(args.objective):
+        fields["num_diffusion_steps"] = args.num_diffusion_steps
+    else:
+        fields["continuous_time_eps"] = args.continuous_time_eps
+    if args.objective == "subs_mask":
+        fields["subs_mask_normalization"] = args.subs_mask_normalization
+    if is_d3pm_objective(args.objective):
+        fields["d3pm_vb_coeff"] = args.d3pm_vb_coeff
+        fields["d3pm_ce_coeff"] = args.d3pm_ce_coeff
+    if args.noise_schedule == "geometric":
+        fields["geometric_noise_level_min"] = args.geometric_noise_level_min
+        fields["geometric_noise_level_max"] = args.geometric_noise_level_max
+    if args.objective == "duo_uniform":
+        fields.update(
+            duo_curriculum_mode=args.duo_curriculum_mode,
+            duo_top_k=args.duo_top_k,
+            duo_log_noise_ratio_min=args.duo_log_noise_ratio_min,
+            duo_log_noise_ratio_max=args.duo_log_noise_ratio_max,
+            duo_softmax_temperature_log10_start=args.duo_softmax_temperature_log10_start,
+            duo_softmax_temperature_log10_end=args.duo_softmax_temperature_log10_end,
+            duo_curriculum_start=args.duo_curriculum_start,
+            duo_curriculum_end=args.duo_curriculum_end,
+            duo_keep_prob_table_path=args.duo_keep_prob_table_path,
+        )
+    return fields
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+
+def apply_dlm_objective_defaults(args) -> None:
+    spec = DLM_OBJECTIVES[args.objective]
+    if args.noise_schedule is None:
+        args.noise_schedule = spec.default_noise_schedule
+    if args.time_conditioning is None:
+        args.time_conditioning = spec.default_time_conditioning
+
+
+def get_model_config(
+    model_name: str,
+    cond_dim: int = 128,
+    dropout: float = 0.1,
+    time_conditioning: bool = False,
+) -> DLMConfig:
+    configs = {
+        "d12": DLMConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+        "d24": DLMConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+        "d36": DLMConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+        "d48": DLMConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+    }
+    config = configs[model_name]
+    config.cond_dim = cond_dim
+    config.dropout = dropout
+    config.time_conditioning = time_conditioning
+    return config
+
+
+# =============================================================================
+# TRAINING ENTRYPOINT
+# =============================================================================
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_files", type=str, default="data/fineweb10B/fineweb_train_*.bin")
+    parser.add_argument("--val_files", type=str, default="data/fineweb10B/fineweb_val_*.bin")
+    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--model", choices=("d12", "d24", "d36", "d48"), default="d12")
+    parser.add_argument("--batch_size", type=int, default=50)
+    parser.add_argument("--sequence_length", type=int, default=1024)
+    parser.add_argument("--total_batch_size", type=int, default=50 * 1024 * 8)
+    parser.add_argument("--num_iterations", type=int, default=10)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--warmup_iters", type=int, default=0)
+    parser.add_argument("--lr_schedule", choices=("constant", "cosine", "inverse_sqrt"), default="constant")
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_eps", type=float, default=1e-8)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--val_loss_every", type=int, default=0)
+    parser.add_argument("--val_max_steps", type=int, default=20)
+    parser.add_argument("--num_checkpoints", type=int, default=1)
+    parser.add_argument("--checkpoint_steps", type=str, default="")
+    parser.add_argument("--skip_checkpoint_save", action="store_true")
+    parser.add_argument("--num_diffusion_steps", type=int, default=1000, help="D3PM training steps T; unused by continuous-time objectives")
+    parser.add_argument("--cond_dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--continuous_time_eps", type=float, default=1e-3)
+    parser.add_argument("--objective", choices=tuple(DLM_OBJECTIVES), default="subs_mask")
+    parser.add_argument("--noise_schedule", choices=("linear", "loglinear", "cosine", "geometric"), default=None)
+    parser.add_argument("--geometric_noise_level_min", type=float, default=DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN)
+    parser.add_argument("--geometric_noise_level_max", type=float, default=DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX)
+    parser.add_argument(
+        "--subs_mask_normalization",
+        dest="subs_mask_normalization",
+        choices=("token_mean", "masked_weight_mean"),
+        default="token_mean",
+    )
+    parser.add_argument("--d3pm_vb_coeff", type=float, default=None)
+    parser.add_argument("--d3pm_ce_coeff", type=float, default=None)
+    parser.add_argument("--duo_curriculum_mode", choices=("softmax", "topk"), default="softmax")
+    parser.add_argument(
+        "--duo_keep_prob_table_path",
+        type=str,
+        default="",
+        help="Pickle table mapping DUO gaussian log noise ratio to uniform keep probability.",
+    )
+    parser.add_argument("--duo_top_k", type=int, default=32)
+    parser.add_argument("--duo_log_noise_ratio_min", type=float, default=-3.55)
+    parser.add_argument("--duo_log_noise_ratio_max", type=float, default=-1.85)
+    parser.add_argument(
+        "--duo_softmax_temperature_log10_start",
+        type=float,
+        default=-3.0,
+    )
+    parser.add_argument(
+        "--duo_softmax_temperature_log10_end",
+        type=float,
+        default=-3.0,
+    )
+    parser.add_argument("--duo_curriculum_start", type=int, default=0)
+    parser.add_argument("--duo_curriculum_end", type=int, default=500_000)
+    parser.add_argument("--time_conditioning", dest="time_conditioning", action="store_true")
+    parser.add_argument("--no_time_conditioning", dest="time_conditioning", action="store_false")
+    parser.set_defaults(time_conditioning=None)
+    parser.add_argument("--antithetic_sampling", dest="antithetic_sampling", action="store_true")
+    parser.add_argument("--no_antithetic_sampling", dest="antithetic_sampling", action="store_false")
+    parser.set_defaults(antithetic_sampling=True)
+    args = parser.parse_args()
+
+    batch_size, seq_len = args.batch_size, args.sequence_length
+    if not (1 <= seq_len <= 1024):
+        raise ValueError("--sequence_length must be between 1 and 1024.")
+    if args.num_checkpoints < 1:
+        raise ValueError("--num_checkpoints must be at least 1.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this trainer.")
+    apply_dlm_objective_defaults(args)
+    objective_spec = DLM_OBJECTIVES[args.objective]
+    args.noise_type = objective_spec.noise_type
+    if objective_spec.d3pm_default_coeffs is not None:
+        default_vb, default_ce = objective_spec.d3pm_default_coeffs
+        if args.d3pm_vb_coeff is None:
+            args.d3pm_vb_coeff = default_vb
+        if args.d3pm_ce_coeff is None:
+            args.d3pm_ce_coeff = default_ce
+        if args.d3pm_vb_coeff < 0 or args.d3pm_ce_coeff < 0:
+            raise ValueError("D3PM coefficients must be non-negative.")
+        if args.d3pm_vb_coeff == 0 and args.d3pm_ce_coeff == 0:
+            raise ValueError("At least one D3PM coefficient must be positive.")
+    if args.objective == "duo_uniform":
+        if args.duo_curriculum_mode == "topk" and args.duo_top_k < 2:
+            raise ValueError("--duo_top_k must be >=2 for DUO topk curriculum.")
+        if not args.time_conditioning:
+            print0("objective=duo_uniform follows official DUO UniformState and requires time_conditioning; enabling it.")
+            args.time_conditioning = True
+    if args.noise_schedule == "geometric":
+        if args.geometric_noise_level_min <= 0 or args.geometric_noise_level_max <= args.geometric_noise_level_min:
+            raise ValueError("--geometric_noise_level_min must be > 0 and < --geometric_noise_level_max.")
+        if args.objective != "sedd_uniform":
+            print0(
+                "noise_schedule=geometric is the official SEDD-uniform schedule; "
+                f"continuing with objective={args.objective} for diagnostics."
+            )
+
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+    rank_seed = args.seed + ddp_rank
+    torch.manual_seed(rank_seed)
+    np.random.seed(rank_seed)
+    print0(f"PyTorch: {torch.version.__version__}")
+    print0(f"Device: {device}")
+    print0(f"seed: base {args.seed} | rank0 local seed {args.seed}")
+
+    tokens_per_step = batch_size * seq_len * ddp_world_size
+    assert args.total_batch_size == tokens_per_step
+
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    model = DiffusionTransformer(
+        get_model_config(
+            args.model,
+            cond_dim=args.cond_dim,
+            dropout=args.dropout,
+            time_conditioning=args.time_conditioning,
+        )
+    ).train().cuda()
+    num_parameters = sum(p.numel() for p in model.parameters())
+    non_embedding_parameters = sum(p.numel() for name, p in model.named_parameters() if "transformer.wte" not in name)
+    if args.objective == "duo_uniform":
+        args._duo_vocab_size = model.config.vocab_size
+        args._duo_keep_prob_table = load_duo_keep_prob_table(args.duo_keep_prob_table_path, device)
+        table_vocab = int(args._duo_keep_prob_table["vocab_size"])
+        if table_vocab != model.config.vocab_size:
+            raise ValueError(
+                f"DUO keep-probability table vocab_size={table_vocab} does not match model vocab_size={model.config.vocab_size}."
+            )
+
+    if hasattr(inductor_config, "coordinate_descent_tuning"):
+        inductor_config.coordinate_descent_tuning = True
+    print0("Compiling model...")
+    model = torch.compile(model)
+
+    train_loader = DistributedDataLoader(args.train_files, batch_size, seq_len, ddp_rank, ddp_world_size, name="train")
+    val_loader = (
+        DistributedDataLoader(args.val_files, batch_size, seq_len, ddp_rank, ddp_world_size, name="val")
+        if args.val_files
+        else None
+    )
+    x = train_loader.next_batch()
+
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module
+    checkpoint_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
+    optimizer = raw_model.configure_optimizers(
+        weight_decay=args.weight_decay,
+        learning_rate=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_eps,
+    )
+    keep_prob_grid = None
+    if is_d3pm_objective(args.objective):
+        # D3PM training grid: t_i=i/T, then keep_prob_i=schedule(t_i).
+        grid_times = torch.linspace(0.0, 1.0, args.num_diffusion_steps + 1, device=device, dtype=torch.float32)
+        keep_prob_grid = keep_prob_from_time(
+            grid_times,
+            args.noise_schedule,
+            args.continuous_time_eps,
+            args.geometric_noise_level_min,
+            args.geometric_noise_level_max,
+        )
+        keep_prob_grid[0] = 1.0
+
+    def sample_training_time(batch_count: int, batch_device: torch.device) -> TimeBatch:
+        if is_d3pm_objective(args.objective):
+            return sample_time(
+                batch_count,
+                args.objective,
+                args.noise_schedule,
+                args.continuous_time_eps,
+                args.antithetic_sampling,
+                batch_device,
+                keep_prob_grid=keep_prob_grid,
+                num_diffusion_steps=args.num_diffusion_steps,
+                geometric_noise_level_min=args.geometric_noise_level_min,
+                geometric_noise_level_max=args.geometric_noise_level_max,
+            )
+        if args.objective == "duo_uniform":
+            return sample_time(
+                batch_count,
+                args.objective,
+                args.noise_schedule,
+                args.continuous_time_eps,
+                args.antithetic_sampling,
+                batch_device,
+                geometric_noise_level_min=args.geometric_noise_level_min,
+                geometric_noise_level_max=args.geometric_noise_level_max,
+                duo_log_noise_ratio_min=args.duo_log_noise_ratio_min,
+                duo_log_noise_ratio_max=args.duo_log_noise_ratio_max,
+                duo_keep_prob_table=getattr(args, "_duo_keep_prob_table", None),
+                duo_vocab_size=getattr(args, "_duo_vocab_size", None),
+            )
+        return sample_time(
+            batch_count,
+            args.objective,
+            args.noise_schedule,
+                args.continuous_time_eps,
+                args.antithetic_sampling,
+                batch_device,
+                geometric_noise_level_min=args.geometric_noise_level_min,
+                geometric_noise_level_max=args.geometric_noise_level_max,
+            )
+
+    def current_duo_inverse_temperature() -> float:
+        return duo_input_inverse_temperature(
+            getattr(args, "_current_step", 0),
+            args.duo_softmax_temperature_log10_start,
+            args.duo_softmax_temperature_log10_end,
+            curriculum_start=args.duo_curriculum_start,
+            curriculum_end=args.duo_curriculum_end,
+        )
+
+    def corrupt_batch(clean_tokens: torch.Tensor, time_batch: TimeBatch) -> torch.Tensor:
+        if args.objective == "duo_uniform":
+            return sample_forward_marginal(
+                clean_tokens,
+                time_batch,
+                args.objective,
+                args.noise_type,
+                raw_model.mask_token_id,
+                raw_model.config.vocab_size,
+                args.duo_curriculum_mode,
+                args.duo_top_k,
+                current_duo_inverse_temperature(),
+            )
+        return sample_forward_marginal(
+            clean_tokens,
+            time_batch,
+            args.objective,
+            args.noise_type,
+            raw_model.mask_token_id,
+            raw_model.config.vocab_size,
+        )
+
+    def forward_noisy(noisy_tokens: torch.Tensor, time_batch: TimeBatch) -> torch.Tensor:
+        return model_forward_noisy(model, noisy_tokens, time_batch, args.objective)
+
+    def get_loss(
+        logits: torch.Tensor,
+        clean_tokens: torch.Tensor,
+        noisy_tokens: torch.Tensor,
+        time_batch: TimeBatch,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        return compute_dlm_loss(
+            logits,
+            clean_tokens,
+            noisy_tokens,
+            time_batch,
+            args.objective,
+            args.noise_type,
+            raw_model.mask_token_id,
+            args.subs_mask_normalization,
+            args.d3pm_vb_coeff or 0.0,
+            args.d3pm_ce_coeff or 0.0,
+        )
+
+    print0("DLM trainer configuration:")
+    for line in objective_summary_lines(args):
+        print0(f"  {line}")
+    print0(f"  model: {args.model} DDiT, sequence_length={args.sequence_length}, time_conditioning={args.time_conditioning}")
+    print0(f"  optimizer: AdamW, lr={args.learning_rate:g}, warmup_iters={args.warmup_iters}, lr_schedule={args.lr_schedule}")
+    print0(f"  dropout: {args.dropout:g}, cond_dim={args.cond_dim}, antithetic_sampling={args.antithetic_sampling}")
+    print0(f"Parameters: total {num_parameters:,} | non-input-embedding {non_embedding_parameters:,}")
+
+    print0("Warming up compiled training step...")
+    model.train()
+    args._current_step = 0
+    warmup_time_batch = sample_training_time(x.size(0), x.device)
+    warmup_noisy_x = corrupt_batch(x, warmup_time_batch)
+    with ctx:
+        warmup_logits = forward_noisy(warmup_noisy_x, warmup_time_batch)
+        warmup_loss, _ = get_loss(warmup_logits, x, warmup_noisy_x, warmup_time_batch)
+    warmup_loss.backward()
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    overall_t0 = time.perf_counter()
+
+    def get_lr(it: int) -> float:
+        assert it <= args.num_iterations
+        if args.warmup_iters > 0 and it < args.warmup_iters:
+            return args.learning_rate * (it + 1) / args.warmup_iters
+        if args.lr_schedule == "constant":
+            return args.learning_rate
+        decay_step = max(1, it + 1)
+        if args.lr_schedule == "inverse_sqrt":
+            warmup = max(1, args.warmup_iters)
+            return args.learning_rate * math.sqrt(warmup) / math.sqrt(decay_step)
+        if args.lr_schedule == "cosine":
+            decay_steps = max(1, args.num_iterations - args.warmup_iters)
+            decay_progress = min(1.0, max(0, it - args.warmup_iters) / decay_steps)
+            return 0.5 * args.learning_rate * (1.0 + math.cos(math.pi * decay_progress))
+        raise ValueError(f"Unsupported lr_schedule={args.lr_schedule!r}")
+
+    run_id = str(uuid.uuid4())
+    logfile = None
+    last_val_loss = None
+    if master_process and args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, f"{run_id}.log")
+        with open(logfile, "w"):
+            pass
+    checkpoint_paths = []
+    checkpoint_records = []
+
+    def record_path(path: str) -> str:
+        checkpoint_dir = args.output_dir if args.output_dir else "logs"
+        try:
+            return os.path.relpath(path, checkpoint_dir)
+        except ValueError:
+            return os.path.basename(path)
+
+    def checkpoint_args() -> dict:
+        saved_args = {key: value for key, value in args.__dict__.items() if not key.startswith("_")}
+        if not is_d3pm_objective(args.objective):
+            saved_args.pop("num_diffusion_steps", None)
+        return saved_args
+
+    def save_checkpoint(tag: str, step: int, timed_elapsed: float, wall_elapsed: float) -> str:
+        if args.skip_checkpoint_save:
+            return ""
+        checkpoint_dir = args.output_dir if args.output_dir else "logs"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"{run_id}_{tag}.pt")
+        log = dict(
+            model=checkpoint_model.state_dict(),
+            ema_model=None,
+            code=code,
+            args={**checkpoint_args(), "recipe": args.objective},
+            trainer="dlm",
+            checkpoint_tag=tag,
+            checkpoint_step=step,
+            timed_training_seconds=timed_elapsed,
+            total_wallclock_seconds=wall_elapsed,
+            total_tokens_processed=tokens_per_step * step,
+        )
+        torch.save(log, checkpoint_path)
+        metadata_path = record_path(checkpoint_path)
+        checkpoint_paths.append(metadata_path)
+        checkpoint_records.append(
+            dict(
+                path=metadata_path,
+                tag=tag,
+                step=step,
+                timed_training_seconds=timed_elapsed,
+                total_wallclock_seconds=wall_elapsed,
+                total_tokens_processed=tokens_per_step * step,
+            )
+        )
+        return checkpoint_path
+
+    if args.checkpoint_steps:
+        checkpoint_steps = {int(item) for item in args.checkpoint_steps.split(",") if item.strip()}
+    else:
+        checkpoint_steps = {int(round(k * args.num_iterations / args.num_checkpoints)) for k in range(1, args.num_checkpoints + 1)}
+    checkpoint_steps = {step for step in checkpoint_steps if 0 < step <= args.num_iterations}
+
+    timings = []
+    timed_training_seconds = 0.0
+    norm = -1.0
+    lossf = None
+    for step in range(args.num_iterations + 1):
+        last_step = step == args.num_iterations
+
+        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step) and val_loader is not None:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(args.val_max_steps):
+                    clean_val = val_loader.next_batch()
+                    time_batch = sample_training_time(clean_val.size(0), clean_val.device)
+                    noisy_val = corrupt_batch(clean_val, time_batch)
+                    with ctx:
+                        logits = forward_noisy(noisy_val, time_batch)
+                        loss, _ = get_loss(logits, clean_val, noisy_val, time_batch)
+                    val_loss += loss.item()
+                val_loss /= args.val_max_steps
+            last_val_loss = float(val_loss)
+            print0(f"val loss {val_loss}")
+            if logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write(f"s:{step} tel:{val_loss}\n")
+
+        if last_step:
+            break
+
+        t0 = time.time()
+        model.train()
+        args._current_step = step
+        time_batch = sample_training_time(x.size(0), x.device)
+        noisy_x = corrupt_batch(x, time_batch)
+        with ctx:
+            logits = forward_noisy(noisy_x, time_batch)
+            loss, loss_terms = get_loss(logits, x, noisy_x, time_batch)
+        x = train_loader.next_batch()
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        torch.cuda.synchronize()
+        t1 = time.time()
+        lossf = loss.item()
+        timed_training_seconds += t1 - t0
+        tokens_per_second = ddp_world_size * batch_size * seq_len / (t1 - t0)
+        metrics_text = " | ".join(f"{name} {value:.6f}" for name, value in sorted(loss_terms.items()))
+        print0(
+            f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | {metrics_text} | "
+            f"norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+        )
+        if logfile is not None:
+            with open(logfile, "a") as f:
+                f.write(f"s:{step} trl:{lossf}\n")
+        if step > 0 and step > args.num_iterations - 20:
+            timings.append(t1 - t0)
+        if master_process and (step + 1) in checkpoint_steps and (step + 1) != args.num_iterations:
+            save_checkpoint(
+                f"step{step + 1:06d}",
+                step + 1,
+                timed_training_seconds,
+                time.perf_counter() - overall_t0,
+            )
+
+    timings = timings[-20:]
+    avg_last_step_ms = float(np.mean(timings) * 1000) if timings else None
+    if avg_last_step_ms is None:
+        print0("final 0 iters avg: n/a")
+    else:
+        print0(f"final {len(timings)} iters avg: {avg_last_step_ms:.3f}ms")
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    if master_process:
+        final_checkpoint_wallclock_seconds = time.perf_counter() - overall_t0
+        checkpoint_path = save_checkpoint(
+            "final",
+            args.num_iterations,
+            timed_training_seconds,
+            final_checkpoint_wallclock_seconds,
+        )
+        total_wallclock_seconds = time.perf_counter() - overall_t0
+        summary = dict(
+            trainer="dlm",
+            run_id=run_id,
+            checkpoint_path=record_path(checkpoint_path) if checkpoint_path else "",
+            checkpoint_paths=checkpoint_paths,
+            checkpoint_records=checkpoint_records,
+            timed_training_seconds=timed_training_seconds,
+            total_wallclock_seconds=total_wallclock_seconds,
+            avg_last_step_ms=avg_last_step_ms,
+            final_train_loss=lossf,
+            final_val_loss=last_val_loss,
+            tokens_per_step=tokens_per_step,
+            total_tokens_processed=tokens_per_step * args.num_iterations,
+            num_iterations=args.num_iterations,
+            model=args.model,
+            batch_size=args.batch_size,
+            sequence_length=args.sequence_length,
+            total_batch_size=args.total_batch_size,
+            train_files=args.train_files,
+            val_files=args.val_files,
+            peak_memory_mib=int(torch.cuda.max_memory_allocated() // 1024 // 1024),
+            **objective_summary_fields(args),
+            learning_rate=args.learning_rate,
+            lr_schedule=args.lr_schedule,
+            time_conditioning=args.time_conditioning,
+            cond_dim=args.cond_dim,
+            dropout=args.dropout,
+            antithetic_sampling=args.antithetic_sampling,
+            warmup_iters=args.warmup_iters,
+            adam_beta1=args.adam_beta1,
+            adam_beta2=args.adam_beta2,
+            adam_eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+            grad_clip=args.grad_clip,
+            seed=args.seed,
+            num_parameters=int(num_parameters),
+            non_embedding_parameters=int(non_embedding_parameters),
+        )
+        print0("TRAIN_RESULT " + json.dumps(summary, sort_keys=True))
+
+    destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== speedrun_dlm/sample_text.py =====
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+from .checkpoint_utils import (
+    DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+    autocast_context,
+    model_time_from_keep_prob,
+    keep_prob_from_time,
+    load_snapshot,
+    make_d3pm_sampling_keep_prob_grid,
+    masked_x0_logprobs,
+    total_noise_rate_from_time,
+    resolve_amp_dtype,
+    tokenizer,
+)
+from .train_dlm import DLM_OBJECTIVES
+
+
+DLM_SAMPLER_CHOICES = (
+    "auto",
+    "subs_mask_ancestral",
+    "d3pm_mask_ancestral",
+    "d3pm_uniform_ancestral",
+    "sedd_euler",
+    "sedd_analytic",
+    "duo_ancestral",
+    "duo_greedy_tail",
+    "duo_psi_rescale",
+    "duo_psi_capped",
+    "duo_psi_loop",
+)
+
+UNIFORM_PSI_SAMPLERS = {"duo_psi_rescale", "duo_psi_capped", "duo_psi_loop"}
+
+DUO_PSI_CONFIGS = {
+    # DUO Chapter II Psi/ReMDM modes. The formulas are official; eta values here
+    # are the explicit benchmark settings used for the release curves.
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/configs/config.yaml#L37-L50
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/scripts/psi_samplers/owt/duo_max_capped_remdm.sh#L1-L30
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/scripts/psi_samplers/owt/duo_max_rescale_eta.sh#L1-L30
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/scripts/psi_samplers/owt/duo_loop_remdm.sh#L1-L30
+    "duo_psi_rescale": {
+        "time_profile": "linear",
+        "high_mode": "max-rescale-0.05",
+        "middle_mode": "max-rescale-0.05",
+        "low_mode": "max-rescale-0.05",
+        "high_frac": 0.0,
+        "middle_frac": 0.0,
+        "top_p": 0.9,
+    },
+    "duo_psi_capped": {
+        # Same official max-capped mode; this benchmark uses eta=0.05.
+        "time_profile": "linear",
+        "high_mode": "max-capped-0.05",
+        "middle_mode": "max-capped-0.05",
+        "low_mode": "max-capped-0.05",
+        "high_frac": 0.0,
+        "middle_frac": 0.0,
+        "top_p": 0.9,
+    },
+    "duo_psi_loop": {
+        "time_profile": "linear-constant-linear-0.9-inv",
+        "high_mode": "pure-posterior",
+        "middle_mode": "constant-remdm-0.01",
+        "low_mode": "pure-posterior",
+        "high_frac": 0.45,
+        "middle_frac": 0.5,
+        "top_p": 0.95,
+    },
+}
+
+
+def checkpoint_objective_and_noise(snapshot_args: dict) -> tuple[str, str]:
+    objective = snapshot_args.get("objective")
+    if objective is None:
+        raise NotImplementedError("DLM checkpoint metadata must include an objective.")
+    if objective not in DLM_OBJECTIVES:
+        raise NotImplementedError(f"Unsupported DLM objective: {objective!r}")
+    required_noise_type = DLM_OBJECTIVES[objective].noise_type
+    noise_type = snapshot_args.get("noise_type") or required_noise_type
+    if noise_type not in {"mask", "uniform"}:
+        raise NotImplementedError(f"Unsupported DLM noise_type: {noise_type!r}")
+    if noise_type != required_noise_type:
+        raise NotImplementedError(
+            f"objective={objective} requires noise_type={required_noise_type}, got {noise_type!r}."
+        )
+    return objective, noise_type
+
+
+def resolve_dlm_sampler(objective: str, dlm_sampler: str) -> str:
+    if dlm_sampler != "auto":
+        return dlm_sampler
+    if objective == "subs_mask":
+        return "subs_mask_ancestral"
+    if objective == "d3pm_mask":
+        return "d3pm_mask_ancestral"
+    if objective == "d3pm_uniform":
+        return "d3pm_uniform_ancestral"
+    if objective in {"sedd_mask", "sedd_uniform"}:
+        return "sedd_analytic"
+    if objective == "duo_uniform":
+        return "duo_ancestral"
+    raise NotImplementedError(f"Unsupported DLM objective: {objective!r}")
+
+
+# =============================================================================
+# SHARED SAMPLING UTILITIES
+# =============================================================================
+
+
+def checkpoint_label(path: str) -> str:
+    return Path(path).name or path
+
+
+def timing(stage: str, seconds: float, **fields) -> None:
+    suffix = "".join(f" {key}={value}" for key, value in fields.items())
+    print(f"TIMING sample_text.{stage} seconds={seconds:.3f}{suffix}", flush=True)
+
+
+def sample_from_probs(
+    probs: torch.Tensor,  # [..., vocab] categorical probabilities or nonnegative weights
+    generator: torch.Generator,
+    greedy: bool,
+) -> torch.Tensor:
+    if greedy:
+        return probs.argmax(dim=-1)
+    flat = probs.reshape(-1, probs.size(-1))
+    draws = torch.multinomial(flat, num_samples=1, replacement=True, generator=generator)
+    return draws.view(probs.shape[:-1])
+
+
+def sample_unnormalized_probs(
+    probs: torch.Tensor,  # [..., vocab] unnormalized nonnegative categorical mass
+    generator: torch.Generator,
+) -> torch.Tensor:
+    # Categorical draw from unnormalized nonnegative mass. This is equivalent
+    # to Gumbel-max over log-mass and keeps mask/token posterior code direct.
+    probs = probs.float()
+    uniforms = torch.rand(probs.shape, device=probs.device, dtype=probs.dtype, generator=generator)
+    exp_noise = 1e-10 - (uniforms + 1e-10).log()
+    return (probs / exp_noise).argmax(dim=-1)
+
+
+def filter_logits(
+    logits: torch.Tensor,  # [..., vocab]
+    top_k: int,
+    top_p: float = 1.0,
+) -> torch.Tensor:
+    if top_k <= 0 or top_k >= logits.size(-1):
+        filtered = logits
+    else:
+        kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+        filtered = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p >= 1.0:
+        return filtered
+    if top_p <= 0.0:
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+    sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    sorted_remove = sorted_probs.cumsum(dim=-1) > top_p
+    sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+    sorted_remove[..., 0] = False
+    remove = torch.zeros_like(sorted_remove).scatter(-1, sorted_indices, sorted_remove)
+    return filtered.masked_fill(remove, float("-inf"))
+
+
+def next_token_probs(
+    logits: torch.Tensor,  # [batch, vocab]
+    temperature: float,
+    top_k: int,
+) -> torch.Tensor:
+    if temperature <= 0.0:
+        return torch.nn.functional.one_hot(logits.argmax(dim=-1), num_classes=logits.size(-1)).float()
+    logits = filter_logits(logits.float() / temperature, top_k)
+    return torch.softmax(logits, dim=-1)
+
+
+def predict_x0_probs(
+    model,
+    current: torch.Tensor,  # [batch, seq]
+    model_times: torch.Tensor,  # [batch]
+    device: str,
+    amp_dtype: str,
+    temperature: float,
+    top_k: int,
+    top_p: float = 1.0,
+    preserve_unmasked: bool = False,
+) -> torch.Tensor:
+    with torch.inference_mode():
+        with autocast_context(device, amp_dtype):
+            raw_logits = model(current, model_times)
+    logits = raw_logits.float()
+    if temperature > 0.0:
+        logits = logits / temperature
+    logits = filter_logits(logits, top_k, top_p=top_p)
+    if preserve_unmasked:
+        return masked_x0_logprobs(logits, current, model.mask_token_id, preserve_unmasked=True).exp()
+    return torch.softmax(logits, dim=-1)
+
+
+# =============================================================================
+# DIFFUSION SCHEDULES
+# =============================================================================
+
+
+def require_sampling_steps(num_sampling_steps: int) -> int:
+    if num_sampling_steps < 1:
+        raise ValueError(f"num_sampling_steps must be at least 1, got {num_sampling_steps}.")
+    return num_sampling_steps
+
+
+def sample_d3pm_keep_prob_grid(
+    snapshot_args: dict,
+    num_sampling_steps: int,
+    device: str,
+    terminal_zero: bool = True,
+) -> torch.Tensor:
+    # D3PM: t_i=i/S, then keep_prob_i=the configured schedule at t_i;
+    # the first/last points are forced to fully clean/noisy by default.
+    # If S is omitted, use the T-step grid on which D3PM was trained.
+    steps = num_sampling_steps or int(snapshot_args.get("num_diffusion_steps", 1000))
+    return make_d3pm_sampling_keep_prob_grid(
+        steps,
+        snapshot_args.get("noise_schedule", "loglinear"),
+        float(snapshot_args.get("continuous_time_eps", 1e-3)),
+        device=device,
+        geometric_noise_level_min=float(snapshot_args.get("geometric_noise_level_min", DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN)),
+        geometric_noise_level_max=float(snapshot_args.get("geometric_noise_level_max", DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX)),
+        terminal_zero=terminal_zero,
+    )
+
+
+def sample_sedd_noise_grids(snapshot_args: dict, num_sampling_steps: int, sampling_eps: float, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Total noise and instantaneous rate on the sampling time grid.
+
+    The analytic predictor uses total-noise differences; Euler uses dt * rate.
+    """
+    steps = require_sampling_steps(num_sampling_steps)
+    # SEDD: t_i=sampling_eps+i*(1-sampling_eps)/S, independent of training T.
+    times = torch.linspace(float(sampling_eps), 1.0, steps + 1, device=device, dtype=torch.float32)
+    schedule = snapshot_args.get("noise_schedule", "loglinear")
+    eps = float(snapshot_args.get("continuous_time_eps", 1e-3))
+    level_min = float(snapshot_args.get("geometric_noise_level_min", DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN))
+    level_max = float(snapshot_args.get("geometric_noise_level_max", DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX))
+    keep_prob = keep_prob_from_time(times, schedule, eps, level_min, level_max)
+    total_noise = -torch.log(keep_prob)
+    total_noise_rate = total_noise_rate_from_time(times, schedule, eps, level_min, level_max)
+    return total_noise, total_noise_rate
+
+
+def sample_duo_official_keep_grid(
+    snapshot_args: dict,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    device: str,
+    ancestral_noise_removal: bool,
+) -> torch.Tensor:
+    # DUO sampling grid/noise-removal path:
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/trainer_base.py#L748-L797
+    steps = require_sampling_steps(num_sampling_steps)
+    eps = float(sampling_eps)
+    if not (0.0 < eps < 1.0):
+        raise ValueError(f"DUO sampling eps must be in (0, 1), got {eps}.")
+
+    noise_schedule = str(snapshot_args.get("duo_sampling_noise_schedule", "loglinear"))
+    if noise_schedule == "log-linear":
+        noise_schedule = "loglinear"
+    # DUO ancestral: t_i=eps+i*(1-eps)/S, then map t_i to keep probability.
+    times = torch.linspace(eps, 1.0, steps + 1, device=device, dtype=torch.float32)
+    scheduled_keep = keep_prob_from_time(
+        times,
+        noise_schedule,
+        float(snapshot_args.get("continuous_time_eps", 1e-3)),
+        float(snapshot_args.get("geometric_noise_level_min", DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN)),
+        float(snapshot_args.get("geometric_noise_level_max", DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX)),
+    )
+    if not ancestral_noise_removal:
+        return scheduled_keep.clamp_min(torch.finfo(scheduled_keep.dtype).tiny)
+
+    keep_grid = torch.empty(steps + 2, device=device, dtype=torch.float32)
+    keep_grid[0] = 1.0
+    keep_grid[1:] = scheduled_keep
+    return keep_grid.clamp_min(torch.finfo(keep_grid.dtype).tiny)
+
+
+def _duo_keep_from_sampling_times(
+    snapshot_args: dict,
+    times: torch.Tensor,  # [S+1] DUO sampler time grid
+) -> torch.Tensor:
+    noise_schedule = str(snapshot_args.get("duo_sampling_noise_schedule", "loglinear"))
+    if noise_schedule == "log-linear":
+        noise_schedule = "loglinear"
+    return keep_prob_from_time(
+        times,
+        noise_schedule,
+        float(snapshot_args.get("continuous_time_eps", 1e-3)),
+        float(snapshot_args.get("geometric_noise_level_min", DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN)),
+        float(snapshot_args.get("geometric_noise_level_max", DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX)),
+    )
+
+
+def _duo_sampling_time_from_keep_prob(snapshot_args: dict, keep_prob: float) -> float:
+    # Needed only for the official linear-constant-linear-0.9-inv Psi/ReMDM profile.
+    noise_schedule = str(snapshot_args.get("duo_sampling_noise_schedule", "loglinear"))
+    if noise_schedule == "log-linear":
+        noise_schedule = "loglinear"
+    eps = float(snapshot_args.get("continuous_time_eps", 1e-3))
+    keep_prob = min(max(float(keep_prob), eps), 1.0)
+    if noise_schedule == "loglinear":
+        return (1.0 - keep_prob) / (1.0 - eps)
+    if noise_schedule == "linear":
+        return 1.0 - keep_prob
+    raise ValueError(f"DUO Psi inverse profile supports linear/loglinear schedules, got {noise_schedule!r}.")
+
+
+def sample_duo_psi_keep_grid(
+    snapshot_args: dict,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    device: str,
+    config: dict,
+) -> torch.Tensor:
+    steps = require_sampling_steps(num_sampling_steps)
+    eps = float(sampling_eps)
+    if not (0.0 < eps < 1.0):
+        raise ValueError(f"DUO sampling eps must be in (0, 1), got {eps}.")
+
+    profile = str(config["time_profile"])
+    if profile == "linear":
+        # DUO Psi linear profile: the same S+1 uniform time points as ancestral.
+        times = torch.linspace(eps, 1.0, steps + 1, device=device, dtype=torch.float32)
+        keep_prob = _duo_keep_from_sampling_times(snapshot_args, times)
+        return keep_prob.clamp_min(torch.finfo(keep_prob.dtype).tiny)
+
+    if not profile.startswith("linear-constant-linear"):
+        raise ValueError(f"Unsupported DUO Psi time_profile={profile!r}.")
+    parts = profile.split("-")
+    constant_keep = float(parts[3])
+    constant_time = _duo_sampling_time_from_keep_prob(snapshot_args, constant_keep) if "inv" in parts[4:] else constant_keep
+    n_hi = round(float(config["high_frac"]) * (steps + 1))
+    n_mid = round(float(config["middle_frac"]) * (steps + 1))
+    n_hi = min(max(n_hi, 1), steps + 1)
+    n_mid = min(max(n_mid, 0), steps + 1 - n_hi)
+    n_low = steps + 1 - n_hi - n_mid
+    noisy_to_clean = [
+        torch.linspace(1.0, constant_time, n_hi, device=device, dtype=torch.float32),
+    ]
+    if n_mid:
+        noisy_to_clean.append(torch.full((n_mid,), constant_time, device=device, dtype=torch.float32))
+    if n_low:
+        noisy_to_clean.append(torch.linspace(constant_time, eps, n_low, device=device, dtype=torch.float32))
+    times = torch.cat(noisy_to_clean)
+    keep_prob = _duo_keep_from_sampling_times(snapshot_args, torch.flip(times, dims=[0]))
+    return keep_prob.clamp_min(torch.finfo(keep_prob.dtype).tiny)
+
+
+def duo_psi_posterior_mix_weights(
+    keep_grid: torch.Tensor,  # [S+1] clean-to-noisy keep probabilities
+    config: dict,
+) -> torch.Tensor:
+    n = keep_grid.numel()
+    noisy_to_clean = torch.flip(keep_grid, dims=[0])
+    n_hi = round(float(config["high_frac"]) * n)
+    n_mid = round(float(config["middle_frac"]) * n)
+    n_hi = min(max(n_hi, 0), n)
+    n_mid = min(max(n_mid, 0), n - n_hi)
+    modes = (
+        (str(config["high_mode"]), noisy_to_clean[:n_hi]),
+        (str(config["middle_mode"]), noisy_to_clean[n_hi : n_hi + n_mid]),
+        (str(config["low_mode"]), noisy_to_clean[n_hi + n_mid :]),
+    )
+    chunks = []
+    for mode, segment in modes:
+        if segment.numel() == 0:
+            continue
+        chunks.append(_duo_psi_mode_to_mix_weights(mode, segment))
+    weights_noisy_to_clean = torch.cat(chunks) if chunks else torch.ones(n, device=keep_grid.device)
+    return torch.flip(weights_noisy_to_clean, dims=[0])
+
+
+def _duo_psi_mode_to_mix_weights(
+    mode: str,
+    keep_segment: torch.Tensor,  # [segment_steps] noisy-to-clean keep probabilities
+) -> torch.Tensor:
+    n = keep_segment.numel()
+    if mode == "pure-posterior":
+        return torch.ones(n, device=keep_segment.device)
+    if mode == "pure-pc":
+        return torch.zeros(n, device=keep_segment.device)
+    eta = float(mode.split("-")[-1])
+    if mode.startswith("constant-") and not mode.startswith("constant-remdm"):
+        return torch.full((n,), eta, device=keep_segment.device)
+    if n < 2:
+        return torch.ones(n, device=keep_segment.device)
+    keep_t = keep_segment[:-1]
+    keep_s = keep_segment[1:]
+    eta_t = torch.full_like(keep_t, eta)
+    tiny = torch.finfo(keep_segment.dtype).tiny
+    if mode.startswith("max-capped-"):
+        removal_mass = torch.minimum(eta_t, (1.0 - keep_s) / keep_t.clamp_min(tiny))
+        removal_mass = torch.where(keep_t == 0, eta_t, removal_mass)
+    elif mode.startswith("max-rescale-"):
+        max_removal_mass = torch.minimum(eta_t, (1.0 - keep_s) / keep_t.clamp_min(tiny))
+        removal_mass = torch.where(keep_t > 0, max_removal_mass, torch.ones_like(keep_t)) * eta
+    elif mode.startswith("constant-remdm"):
+        removal_mass = eta_t
+    else:
+        raise ValueError(f"Unsupported DUO Psi mode={mode!r}.")
+    mix_weights = torch.clip(1.0 - removal_mass / (1.0 - keep_s).clamp_min(tiny), 0.0, 1.0)
+    return torch.cat([mix_weights, torch.ones(1, device=keep_segment.device, dtype=keep_segment.dtype)])
+
+
+# =============================================================================
+# MASK-STATE ANCESTRAL KERNEL
+# =============================================================================
+
+
+def mask_loglinear_model_time(snapshot_args: dict, mask_prob: float, batch_size: int, device: str) -> torch.Tensor:
+    if snapshot_args.get("noise_schedule", "loglinear") != "loglinear":
+        raise ValueError("The release sampler expects a loglinear mask-corruption checkpoint.")
+    eps = float(snapshot_args.get("continuous_time_eps", 1e-3))
+    mask_prob_tensor = torch.tensor(mask_prob, dtype=torch.float32, device=device)
+    total_noise = -torch.log1p(-(1.0 - eps) * mask_prob_tensor)
+    return total_noise.expand(batch_size)
+
+
+def mask_ancestral_posterior_mass(
+    x0_probs: torch.Tensor,  # [batch, seq, vocab] x0 probabilities
+    mask_token_id: int,
+    prev_keep: float,
+    current_keep: float,
+) -> torch.Tensor:
+    # Absorbing posterior mass q(x_s | x_t, x0). SUBS uses a continuous mask-
+    # probability grid; D3PM-mask uses the same expression on a discrete grid.
+    token_mass_scale = max(float(prev_keep) - float(current_keep), 0.0)
+    mask_mass_value = max(1.0 - float(prev_keep), 0.0)
+    token_mass = x0_probs * max(token_mass_scale, 0.0)
+    vocab_size = token_mass.size(-1)
+    if mask_token_id == vocab_size:
+        mask_mass = torch.full(
+            (*token_mass.shape[:-1], 1),
+            max(mask_mass_value, 0.0),
+            device=x0_probs.device,
+            dtype=token_mass.dtype,
+        )
+        return torch.cat([token_mass, mask_mass], dim=-1)
+    if 0 <= mask_token_id < vocab_size:
+        mass = token_mass.clone()
+        mass[..., mask_token_id] = max(mask_mass_value, 0.0)
+        return mass
+    raise ValueError(f"mask_token_id={mask_token_id} is incompatible with vocab size {vocab_size}.")
+
+
+def sample_mask_ancestral_state(
+    model,
+    current: torch.Tensor,  # [batch, seq]
+    posterior_keep_grid: torch.Tensor,  # [S+1] clean-to-noisy keep probabilities
+    model_times_for_step,
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    temperature: float,
+    top_k: int,
+    preserve_unmasked_x0: bool,
+    cache_x0_probs: bool,
+    time_conditioning: bool,
+    final_denoise: str,
+) -> torch.Tensor:
+    if final_denoise not in {"argmax_all", "sample_masked"}:
+        raise ValueError(f"Unsupported mask final_denoise={final_denoise!r}.")
+    greedy = temperature <= 0.0
+    x0_probs_cache = None
+
+    for step in range(posterior_keep_grid.numel() - 1, 0, -1):
+        if x0_probs_cache is None:
+            x0_probs_cache = predict_x0_probs(
+                model,
+                current,
+                model_times_for_step(step, current.size(0)),
+                device=device,
+                amp_dtype=amp_dtype,
+                temperature=temperature,
+                top_k=top_k,
+                preserve_unmasked=preserve_unmasked_x0,
+            )
+
+        posterior_mass = mask_ancestral_posterior_mass(
+            x0_probs_cache,
+            model.mask_token_id,
+            prev_keep=float(posterior_keep_grid[step - 1].item()),
+            current_keep=float(posterior_keep_grid[step].item()),
+        )
+        proposal = posterior_mass.argmax(dim=-1) if greedy else sample_unnormalized_probs(posterior_mass, generator)
+        next_state = torch.where(current.eq(model.mask_token_id), proposal, current)
+        if (not cache_x0_probs) or (not torch.equal(next_state, current)) or time_conditioning:
+            x0_probs_cache = None
+        current = next_state
+
+    final_mask = current.eq(model.mask_token_id)
+    if final_denoise == "sample_masked" and not final_mask.any():
+        return current
+    final_probs = predict_x0_probs(
+        model,
+        current,
+        model_times_for_step(0, current.size(0)),
+        device=device,
+        amp_dtype=amp_dtype,
+        temperature=temperature,
+        top_k=top_k,
+        preserve_unmasked=preserve_unmasked_x0,
+    )
+    if final_denoise == "argmax_all":
+        return final_probs.argmax(dim=-1)
+    fill = sample_from_probs(final_probs, generator, greedy=greedy)
+    if final_denoise == "sample_masked":
+        return torch.where(final_mask, fill, current)
+    raise AssertionError("unreachable mask final_denoise branch")
+
+
+# =============================================================================
+# AR SAMPLER
+# =============================================================================
+
+
+def sample_ar(
+    model,
+    prompt_tokens: list[int],
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+) -> list[int]:
+    tokens = list(prompt_tokens) if prompt_tokens else [getattr(tokenizer, "eot_token", 50256)]
+    greedy = temperature <= 0.0
+    for _ in range(max_new_tokens):
+        # no kv cache here each step reruns the current prefix
+        idx = torch.tensor(tokens[-model.config.block_size :], dtype=torch.long, device=device).unsqueeze(0)
+        with torch.inference_mode():
+            with autocast_context(device, amp_dtype):
+                logits, _ = model(idx, targets=None, return_logits=True)
+        probs = next_token_probs(logits[:, -1, :], temperature, top_k)
+        tokens.append(int(sample_from_probs(probs, generator, greedy=greedy)[0].item()))
+    return tokens
+
+
+# =============================================================================
+# MASK-SAMPLER METHOD WRAPPERS
+# =============================================================================
+
+
+def sample_subs_mask_ancestral_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    temperature: float,
+    top_k: int,
+    num_sampling_steps: int,
+    sampling_eps: float,
+) -> torch.Tensor:
+    if not (0.0 < sampling_eps < 1.0):
+        raise ValueError(f"sampling_eps must be in (0, 1), got {sampling_eps}.")
+
+    num_steps = require_sampling_steps(num_sampling_steps)
+    # SUBS: p_mask_i=sampling_eps+i*(1-sampling_eps)/S, independent of training T.
+    mask_prob_grid = torch.linspace(float(sampling_eps), 1.0, num_steps + 1, device=current.device, dtype=torch.float32)
+    posterior_keep_grid = 1.0 - mask_prob_grid
+
+    def model_times_for_step(step: int, batch_size: int) -> torch.Tensor:
+        return mask_loglinear_model_time(snapshot_args, float(mask_prob_grid[step].item()), batch_size, device)
+
+    # SUBS mask ancestral sampler:
+    # https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/diffusion.py#L612-L637
+    return sample_mask_ancestral_state(
+        model,
+        current,
+        posterior_keep_grid=posterior_keep_grid,
+        model_times_for_step=model_times_for_step,
+        device=device,
+        amp_dtype=amp_dtype,
+        generator=generator,
+        temperature=temperature,
+        top_k=top_k,
+        preserve_unmasked_x0=True,
+        cache_x0_probs=True,
+        time_conditioning=bool(snapshot_args.get("time_conditioning", False)),
+        final_denoise="argmax_all",
+    )
+
+
+# =============================================================================
+# UNIFORM-STATE ANCESTRAL KERNEL
+# =============================================================================
+
+
+def uniform_forward_process_probs(
+    x0_probs: torch.Tensor,  # [batch, seq, vocab] x0 probabilities
+    keep_prob: float,
+) -> torch.Tensor:
+    vocab_size = x0_probs.size(-1)
+    keep = x0_probs.new_tensor(float(keep_prob))
+    return keep * x0_probs + (1.0 - keep) / vocab_size
+
+
+def uniform_ancestral_posterior_probs(
+    x0_probs: torch.Tensor,  # [batch, seq, vocab] x0 probabilities
+    current: torch.Tensor,  # [batch, seq]
+    prev_keep: float,
+    current_keep: float,
+) -> torch.Tensor:
+    # Uniform-state posterior q(x_s | x_t, x0), used by D3PM, DUO, and DUO Psi:
+    # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L307-L335
+    vocab_size = x0_probs.size(-1)
+    dtype = x0_probs.dtype
+    tiny = torch.finfo(dtype).tiny
+    keep_s = x0_probs.new_tensor(float(prev_keep)).clamp_min(tiny)
+    keep_t = x0_probs.new_tensor(float(current_keep)).clamp_min(0.0)
+    keep_t_given_s = keep_t / keep_s
+    keep_delta = keep_s - keep_t
+    xt_one_hot = F.one_hot(current, num_classes=vocab_size).to(dtype)
+    x0_at_xt = x0_probs.gather(-1, current.unsqueeze(-1))
+    numerator = (
+        keep_t * vocab_size * x0_probs * xt_one_hot
+        + (keep_t_given_s - keep_t) * xt_one_hot
+        + keep_delta * x0_probs
+        + (1.0 - keep_t_given_s) * (1.0 - keep_s) / vocab_size
+    )
+    denom = keep_t * vocab_size * x0_at_xt + (1.0 - keep_t)
+    posterior = numerator / denom.clamp_min(tiny)
+    return posterior.clamp_min(0.0) / posterior.sum(dim=-1, keepdim=True).clamp_min(tiny)
+
+
+def sample_uniform_ancestral_chain(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    temperature: float,
+    top_k: int,
+    keep_grid: torch.Tensor,  # [S+1] clean-to-noisy keep probabilities
+    final_step_argmax: bool = False,
+) -> torch.Tensor:
+    greedy = temperature <= 0.0
+
+    for step in range(keep_grid.numel() - 1, 0, -1):
+        model_times = model_time_from_keep_prob(snapshot_args, keep_grid, step, batch_size=current.size(0), device=device)
+        x0_probs = predict_x0_probs(
+            model,
+            current,
+            model_times,
+            device=device,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        prev_keep = float(keep_grid[step - 1].item())
+        current_keep = float(keep_grid[step].item())
+        posterior = uniform_ancestral_posterior_probs(
+            x0_probs,
+            current,
+            prev_keep=prev_keep,
+            current_keep=current_keep,
+        )
+        if greedy or (final_step_argmax and step == 1):
+            current = posterior.argmax(dim=-1)
+        else:
+            current = sample_from_probs(posterior, generator, greedy=False)
+
+    return current
+
+
+def sample_uniform_psi_chain(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    temperature: float,
+    top_k: int,
+    keep_grid: torch.Tensor,  # [S+1] clean-to-noisy keep probabilities
+    psi_config: dict,
+) -> torch.Tensor:
+    greedy = temperature <= 0.0
+    top_p = float(psi_config.get("top_p", 1.0))
+    posterior_mix_weights = duo_psi_posterior_mix_weights(keep_grid, psi_config).to(device=current.device, dtype=torch.float32)
+
+    for step in range(keep_grid.numel() - 1, 0, -1):
+        model_times = model_time_from_keep_prob(snapshot_args, keep_grid, step, batch_size=current.size(0), device=device)
+        x0_probs = predict_x0_probs(
+            model,
+            current,
+            model_times,
+            device=device,
+            amp_dtype=amp_dtype,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+
+        prev_keep = float(keep_grid[step - 1].item())
+        current_keep = float(keep_grid[step].item())
+        q_xs = uniform_ancestral_posterior_probs(
+            x0_probs,
+            current,
+            prev_keep=prev_keep,
+            current_keep=current_keep,
+        )
+        q_x0 = uniform_ancestral_posterior_probs(
+            x0_probs,
+            current,
+            prev_keep=1.0,
+            current_keep=current_keep,
+        )
+        pc_q_xs = uniform_forward_process_probs(q_x0, prev_keep)
+        posterior_mix = posterior_mix_weights[step].to(dtype=q_xs.dtype)
+        posterior = posterior_mix * q_xs + (1.0 - posterior_mix) * pc_q_xs
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(posterior.dtype).tiny)
+        current = posterior.argmax(dim=-1) if greedy else sample_from_probs(posterior, generator, greedy=False)
+
+    return current
+
+
+# =============================================================================
+# D3PM METHOD WRAPPERS
+# =============================================================================
+
+
+def sample_d3pm_uniform_ancestral_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    num_sampling_steps: int,
+    temperature: float,
+    top_k: int,
+) -> torch.Tensor:
+    keep_grid = sample_d3pm_keep_prob_grid(snapshot_args, num_sampling_steps, device)
+    return sample_uniform_ancestral_chain(
+        model,
+        snapshot_args,
+        current,
+        device=device,
+        amp_dtype=amp_dtype,
+        generator=generator,
+        temperature=temperature,
+        top_k=top_k,
+        keep_grid=keep_grid,
+        final_step_argmax=True,
+    )
+
+
+def sample_d3pm_uniform_psi_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    num_sampling_steps: int,
+    temperature: float,
+    top_k: int,
+    sampler: str,
+) -> torch.Tensor:
+    keep_grid = sample_d3pm_keep_prob_grid(snapshot_args, num_sampling_steps, device)
+    return sample_uniform_psi_chain(
+        model,
+        snapshot_args,
+        current,
+        device=device,
+        amp_dtype=amp_dtype,
+        generator=generator,
+        temperature=temperature,
+        top_k=top_k,
+        keep_grid=keep_grid,
+        psi_config=DUO_PSI_CONFIGS[sampler],
+    )
+
+
+def sample_d3pm_mask_ancestral_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    num_sampling_steps: int,
+    temperature: float,
+    top_k: int,
+) -> torch.Tensor:
+    keep_grid = sample_d3pm_keep_prob_grid(snapshot_args, num_sampling_steps, device)
+
+    def model_times_for_step(step: int, batch_size: int) -> torch.Tensor:
+        return model_time_from_keep_prob(snapshot_args, keep_grid, step, batch_size=batch_size, device=device)
+
+    # Absorbing-state D3PM ancestral posterior specialization:
+    # https://github.com/google-research/google-research/blob/1fa17414f56c3703d5adb3818338b6e35e0fd550/d3pm/text/diffusion.py#L303-L428
+    return sample_mask_ancestral_state(
+        model,
+        current,
+        posterior_keep_grid=keep_grid,
+        model_times_for_step=model_times_for_step,
+        device=device,
+        amp_dtype=amp_dtype,
+        generator=generator,
+        temperature=temperature,
+        top_k=top_k,
+        preserve_unmasked_x0=False,
+        cache_x0_probs=False,
+        time_conditioning=bool(snapshot_args.get("time_conditioning", False)),
+        final_denoise="sample_masked",
+    )
+
+
+# =============================================================================
+# SEDD REVERSE-RATE SAMPLERS
+# =============================================================================
+
+# SEDD reverse rates, staggered scores, and denoiser:
+# https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/graph_lib.py#L77-L189
+# https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/graph_lib.py#L192-L266
+# https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/sampling.py#L59-L105
+
+
+def sedd_log_score(
+    model,
+    current: torch.Tensor,  # [batch, seq]
+    total_noise: torch.Tensor,  # [batch]
+    objective: str,
+    device: str,
+    amp_dtype: str,
+) -> torch.Tensor:
+    with torch.inference_mode():
+        with autocast_context(device, amp_dtype):
+            raw_logits = model(current, total_noise.expand(current.size(0)))
+    if objective == "sedd_uniform":
+        log_score = raw_logits.float()
+        log_score.scatter_(-1, current.unsqueeze(-1), torch.zeros_like(log_score[..., :1]))
+        return log_score
+    if objective == "sedd_mask":
+        vocab_size = raw_logits.size(-1)
+        expm1_noise = torch.expm1(total_noise)
+        esigm1_log = torch.log(expm1_noise.clamp_min(torch.finfo(expm1_noise.dtype).tiny)).view(-1, 1, 1)
+        log_score = raw_logits.float() - esigm1_log - math.log(vocab_size)
+        mask_col = torch.zeros(*log_score.shape[:-1], 1, device=log_score.device, dtype=log_score.dtype)
+        log_score = torch.cat([log_score, mask_col], dim=-1)
+        log_score.scatter_(-1, current.unsqueeze(-1), torch.zeros_like(log_score[..., :1]))
+        return log_score
+    raise NotImplementedError(f"Unsupported SEDD objective: {objective!r}")
+
+
+def sample_sedd_euler_step(
+    current: torch.Tensor,  # [batch, seq]
+    score: torch.Tensor,  # [batch, seq, vocab]
+    noise_type: str,
+    noise_step: torch.Tensor,  # [batch]
+    generator: torch.Generator,
+) -> torch.Tensor:
+    probs = sedd_euler_probs(current, score, noise_type, noise_step)
+    return sample_from_probs(probs, generator, greedy=False)
+
+
+def sedd_euler_probs(
+    current: torch.Tensor,  # [batch, seq]
+    score: torch.Tensor,  # [batch, seq, vocab]
+    noise_type: str,
+    noise_step: torch.Tensor,  # [batch]
+) -> torch.Tensor:
+    dim = score.size(-1)
+    one_hot = F.one_hot(current, num_classes=dim).to(score.dtype)
+    if noise_type == "uniform":
+        rate = torch.ones_like(score) / dim
+        rate.scatter_(-1, current.unsqueeze(-1), -torch.full_like(score[..., :1], (dim - 1) / dim))
+    elif noise_type == "mask":
+        mask_id = dim - 1
+        rate = -one_hot
+        mask_rows = current.eq(mask_id)
+        if mask_rows.any():
+            rate[mask_rows] += 1
+    else:
+        raise NotImplementedError(f"Unsupported SEDD noise_type: {noise_type!r}")
+    reverse_rate = rate * score
+    reverse_rate.scatter_(-1, current.unsqueeze(-1), torch.zeros_like(reverse_rate[..., :1]))
+    reverse_rate.scatter_(-1, current.unsqueeze(-1), -reverse_rate.sum(dim=-1, keepdim=True))
+    probs = one_hot + noise_step.view(-1, 1, 1).to(score.dtype) * reverse_rate
+    probs = probs.clamp_min(0.0)
+    return probs / probs.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(probs.dtype).tiny)
+
+
+def sample_sedd_analytic_step(
+    current: torch.Tensor,  # [batch, seq]
+    score: torch.Tensor,  # [batch, seq, vocab]
+    noise_type: str,
+    noise_step: torch.Tensor,  # [batch]
+    generator: torch.Generator,
+    denoise: bool = False,
+) -> torch.Tensor:
+    probs = sedd_analytic_probs(current, score, noise_type, noise_step, denoise=denoise)
+    return sample_from_probs(probs, generator, greedy=False)
+
+
+def sample_sedd_denoise_step(
+    current: torch.Tensor,  # [batch, seq]
+    score: torch.Tensor,  # [batch, seq, vocab]
+    noise_type: str,
+    total_noise: torch.Tensor,  # [batch]
+    generator: torch.Generator,
+) -> torch.Tensor:
+    return sample_sedd_analytic_step(
+        current,
+        score,
+        noise_type,
+        total_noise,
+        generator,
+        denoise=(noise_type == "mask"),
+    )
+
+
+def sedd_analytic_probs(
+    current: torch.Tensor,  # [batch, seq]
+    score: torch.Tensor,  # [batch, seq, vocab]
+    noise_type: str,
+    noise_step: torch.Tensor,  # [batch]
+    denoise: bool = False,
+) -> torch.Tensor:
+    dim = score.size(-1)
+    noise_step_view = noise_step.view(-1, 1, 1).to(score.dtype)
+    if noise_type == "uniform":
+        epow = torch.exp(-noise_step_view)
+        staggered = ((epow - 1.0) / (dim * epow)) * score.sum(dim=-1, keepdim=True) + score / epow
+        transition = torch.full_like(score, 0.0)
+        off_diag = (1.0 - epow) / dim
+        transition += off_diag
+        transition.scatter_(
+            -1,
+            current.unsqueeze(-1),
+            (1.0 - off_diag.squeeze(-1).squeeze(-1) * (dim - 1)).view(-1, 1, 1).expand_as(current.unsqueeze(-1)).to(score.dtype),
+        )
+        probs = staggered * transition
+    elif noise_type == "mask":
+        exp_noise_step = torch.exp(noise_step_view)
+        staggered = score.clone()
+        extra_const = (1.0 - exp_noise_step.squeeze(-1)) * score.sum(dim=-1)
+        staggered = staggered * exp_noise_step
+        staggered[..., -1] += extra_const
+        exp_neg = torch.exp(-noise_step_view)
+        transition = exp_neg * F.one_hot(current, num_classes=dim).to(score.dtype)
+        transition = transition + torch.where(
+            current.eq(dim - 1).unsqueeze(-1),
+            # Keep [batch, 1, 1] so batched sampling broadcasts over sequence/vocab axes.
+            1.0 - exp_neg,
+            torch.zeros_like(score),
+        )
+        probs = staggered * transition
+        if denoise:
+            probs = probs[..., :-1]
+    else:
+        raise NotImplementedError(f"Unsupported SEDD noise_type: {noise_type!r}")
+    probs = probs.clamp_min(0.0)
+    return probs / probs.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(probs.dtype).tiny)
+
+
+def sample_sedd_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    objective: str,
+    noise_type: str,
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    predictor: str,
+    denoise: bool = True,
+) -> torch.Tensor:
+    total_noise_grid, total_noise_rate_grid = sample_sedd_noise_grids(snapshot_args, num_sampling_steps, sampling_eps, device)
+    dt = (1.0 - float(sampling_eps)) / (total_noise_grid.numel() - 1)  # official get_pc_sampler step_size
+    for step in range(total_noise_grid.numel() - 1, 0, -1):
+        current_noise = total_noise_grid[step].view(1)
+        prev_noise = total_noise_grid[step - 1].view(1)
+        score = sedd_log_score(
+            model,
+            current,
+            current_noise.expand(current.size(0)),
+            objective=objective,
+            device=device,
+            amp_dtype=amp_dtype,
+        ).exp()
+        if predictor == "sedd_euler":
+            # Official EulerPredictor: reverse update uses dt * rate_noise(t) (sampling.py L61-67).
+            noise_step = (dt * total_noise_rate_grid[step]).clamp_min(0.0).view(1).expand(current.size(0))
+            current = sample_sedd_euler_step(current, score, noise_type, noise_step, generator)
+        elif predictor == "sedd_analytic":
+            # Official AnalyticPredictor: reverse update uses the total-noise drop (sampling.py L77-86).
+            noise_step = (current_noise - prev_noise).clamp_min(0.0).expand(current.size(0))
+            current = sample_sedd_analytic_step(current, score, noise_type, noise_step, generator)
+        else:
+            raise NotImplementedError(f"Unsupported SEDD predictor: {predictor!r}")
+
+    if denoise:
+        final_noise = total_noise_grid[0].view(1).expand(current.size(0))
+        score = sedd_log_score(
+            model,
+            current,
+            final_noise,
+            objective=objective,
+            device=device,
+            amp_dtype=amp_dtype,
+        ).exp()
+        current = sample_sedd_denoise_step(
+            current,
+            score,
+            noise_type,
+            final_noise,
+            generator,
+        )
+    return current
+
+
+# =============================================================================
+# DUO UNIFORM-STATE SAMPLERS
+# =============================================================================
+
+# DUO official sampling reuses the same uniform-state ancestral posterior as
+# D3PM-uniform, with DUO's keep grid and final noise-removal convention.
+# https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L307-L335
+# https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/trainer_base.py#L633-L672
+# https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/trainer_base.py#L748-L797
+
+
+def sample_duo_uniform_state(
+    model,
+    snapshot_args: dict,
+    current: torch.Tensor,  # [batch, seq]
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    noise_removal: str = "ancestral",
+    sampler: str = "duo_ancestral",
+) -> torch.Tensor:
+    if noise_removal not in {"ancestral", "greedy"}:
+        raise ValueError(f"Unsupported DUO noise_removal={noise_removal!r}.")
+    if sampler in UNIFORM_PSI_SAMPLERS:
+        keep_grid = sample_duo_psi_keep_grid(
+            snapshot_args,
+            num_sampling_steps,
+            sampling_eps,
+            device,
+            config=DUO_PSI_CONFIGS[sampler],
+        )
+        current = sample_uniform_psi_chain(
+            model,
+            snapshot_args,
+            current,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            temperature=1.0,
+            top_k=0,
+            keep_grid=keep_grid,
+            psi_config=DUO_PSI_CONFIGS[sampler],
+        )
+        if noise_removal == "ancestral":
+            final_grid = torch.stack([torch.ones_like(keep_grid[0]), keep_grid[0]]).to(device=current.device)
+            current = sample_uniform_ancestral_chain(
+                model,
+                snapshot_args,
+                current,
+                device=device,
+                amp_dtype=amp_dtype,
+                generator=generator,
+                temperature=1.0,
+                top_k=0,
+                keep_grid=final_grid,
+            )
+    else:
+        keep_grid = sample_duo_official_keep_grid(
+            snapshot_args,
+            num_sampling_steps,
+            sampling_eps,
+            device,
+            ancestral_noise_removal=(noise_removal == "ancestral"),
+        )
+        current = sample_uniform_ancestral_chain(
+            model,
+            snapshot_args,
+            current,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            temperature=1.0,
+            top_k=0,
+            keep_grid=keep_grid,
+        )
+    if noise_removal == "greedy":
+        model_times = model_time_from_keep_prob(snapshot_args, keep_grid, 0, batch_size=current.size(0), device=device)
+        current = predict_x0_probs(
+            model,
+            current,
+            model_times,
+            device=device,
+            amp_dtype=amp_dtype,
+            temperature=1.0,
+            top_k=0,
+        ).argmax(dim=-1)
+    return current
+
+
+def sample_dlm(
+    model,
+    snapshot_args: dict,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    device: str,
+    amp_dtype: str,
+    generator: torch.Generator,
+    dlm_sampler: str,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    batch_size: int = 1,
+) -> list[list[int]]:
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+    objective, noise_type = checkpoint_objective_and_noise(snapshot_args)
+    dlm_sampler = resolve_dlm_sampler(objective, dlm_sampler)
+    if objective == "subs_mask":
+        if noise_type != "mask":
+            raise NotImplementedError(f"subs_mask checkpoints require mask noise, got noise_type={noise_type!r}.")
+        current = torch.full((batch_size, max_new_tokens), model.mask_token_id, dtype=torch.long, device=device)
+        if dlm_sampler != "subs_mask_ancestral":
+            raise NotImplementedError(f"Unsupported SUBS mask sampler: {dlm_sampler!r}")
+        current = sample_subs_mask_ancestral_state(
+            model,
+            snapshot_args,
+            current,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            temperature=temperature,
+            top_k=top_k,
+            num_sampling_steps=num_sampling_steps,
+            sampling_eps=sampling_eps,
+        )
+    elif objective in {"d3pm_mask", "d3pm_uniform"}:
+        expected_sampler = f"{objective}_ancestral"
+        if dlm_sampler != expected_sampler and not (objective == "d3pm_uniform" and dlm_sampler in UNIFORM_PSI_SAMPLERS):
+            raise NotImplementedError(
+                f"objective={objective} requires sampler={expected_sampler}"
+                f"{' or a DUO Psi uniform sampler' if objective == 'd3pm_uniform' else ''}, got {dlm_sampler!r}."
+            )
+        if noise_type == "uniform":
+            current = torch.randint(model.config.vocab_size, (batch_size, max_new_tokens), device=device, generator=generator)
+            if dlm_sampler in UNIFORM_PSI_SAMPLERS:
+                current = sample_d3pm_uniform_psi_state(
+                    model,
+                    snapshot_args,
+                    current,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    generator=generator,
+                    num_sampling_steps=num_sampling_steps,
+                    temperature=temperature,
+                    top_k=top_k,
+                    sampler=dlm_sampler,
+                )
+            else:
+                current = sample_d3pm_uniform_ancestral_state(
+                    model,
+                    snapshot_args,
+                    current,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    generator=generator,
+                    num_sampling_steps=num_sampling_steps,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
+        elif noise_type == "mask":
+            current = torch.full((batch_size, max_new_tokens), model.mask_token_id, dtype=torch.long, device=device)
+            current = sample_d3pm_mask_ancestral_state(
+                model,
+                snapshot_args,
+                current,
+                device=device,
+                amp_dtype=amp_dtype,
+                generator=generator,
+                num_sampling_steps=num_sampling_steps,
+                temperature=temperature,
+                top_k=top_k,
+            )
+        else:
+            raise NotImplementedError(f"Unsupported D3PM noise_type: {noise_type!r}")
+    elif objective == "sedd_mask":
+        if dlm_sampler not in {"sedd_euler", "sedd_analytic"}:
+            raise NotImplementedError(f"Unsupported SEDD mask sampler: {dlm_sampler!r}")
+        current = torch.full((batch_size, max_new_tokens), model.mask_token_id, dtype=torch.long, device=device)
+        current = sample_sedd_state(
+            model,
+            snapshot_args,
+            current,
+            objective=objective,
+            noise_type=noise_type,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            num_sampling_steps=num_sampling_steps,
+            sampling_eps=sampling_eps,
+            predictor=dlm_sampler,
+            denoise=True,
+        )
+    elif objective == "sedd_uniform":
+        if dlm_sampler not in {"sedd_euler", "sedd_analytic"}:
+            raise NotImplementedError(f"Unsupported SEDD uniform sampler: {dlm_sampler!r}")
+        current = torch.randint(model.config.vocab_size, (batch_size, max_new_tokens), device=device, generator=generator)
+        current = sample_sedd_state(
+            model,
+            snapshot_args,
+            current,
+            objective=objective,
+            noise_type=noise_type,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            num_sampling_steps=num_sampling_steps,
+            sampling_eps=sampling_eps,
+            predictor=dlm_sampler,
+            denoise=True,
+        )
+    elif objective == "duo_uniform":
+        if dlm_sampler not in {"duo_ancestral", "duo_greedy_tail", *UNIFORM_PSI_SAMPLERS}:
+            raise NotImplementedError(f"Unsupported DUO sampler: {dlm_sampler!r}")
+        current = torch.randint(model.config.vocab_size, (batch_size, max_new_tokens), device=device, generator=generator)
+        current = sample_duo_uniform_state(
+            model,
+            snapshot_args,
+            current,
+            device=device,
+            amp_dtype=amp_dtype,
+            generator=generator,
+            num_sampling_steps=num_sampling_steps,
+            sampling_eps=sampling_eps,
+            noise_removal="greedy" if dlm_sampler == "duo_greedy_tail" else "ancestral",
+            sampler=dlm_sampler,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported DLM path: noise_type={noise_type!r}, objective={objective!r}")
+    return current.tolist()
+
+
+# =============================================================================
+# IO AND CLI
+# =============================================================================
+
+
+def write_markdown(rows: list[dict], path: Path) -> None:
+    lines = ["# Samples", ""]
+    for row in rows:
+        lines.extend(
+            [
+                f"## sample {row['sample_index']}",
+                "",
+                row["target_text"].strip(),
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sample unconditional text from an AR or release DLM checkpoint.")
+    parser.add_argument("snapshot_path")
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--samples_per_prompt", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
+    parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
+    parser.add_argument(
+        "--dlm_sampler",
+        choices=DLM_SAMPLER_CHOICES,
+        default="auto",
+    )
+    parser.add_argument("--num_sampling_steps", type=int, default=1000)
+    parser.add_argument("--sampling_eps", type=float, default=1e-5)
+    parser.add_argument(
+        "--sampling_batch_size",
+        type=int,
+        default=1,
+        help="Number of unconditional DLM samples to generate per model pass batch. AR sampling remains unbatched.",
+    )
+    parser.add_argument("--output_json", default="")
+    parser.add_argument("--output_md", default="")
+    args = parser.parse_args()
+
+    total_start = time.perf_counter()
+    setup_start = time.perf_counter()
+    device = args.device
+    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
+    timing("resolve_amp_dtype", time.perf_counter() - setup_start, device=device, amp_dtype=amp_dtype)
+    load_start = time.perf_counter()
+    snapshot = load_snapshot(args.snapshot_path, device=device, checkpoint_variant=args.checkpoint_variant)
+    timing("load_snapshot", time.perf_counter() - load_start, trainer=snapshot.trainer)
+    generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
+    reported_dlm_sampler = ""
+    if snapshot.trainer == "dlm":
+        objective, _ = checkpoint_objective_and_noise(snapshot.args)
+        reported_dlm_sampler = resolve_dlm_sampler(objective, args.dlm_sampler)
+
+    rows = []
+    generation_start = time.perf_counter()
+    sample_index = 0
+    while sample_index < args.samples_per_prompt:
+        chunk_start = time.perf_counter()
+        if snapshot.trainer == "ar":
+            chunk_size = 1
+            local_seed = args.seed + sample_index
+            generator.manual_seed(local_seed)
+            tokens = sample_ar(
+                snapshot.model,
+                [getattr(tokenizer, "eot_token", 50256)],
+                args.max_new_tokens,
+                args.temperature,
+                args.top_k,
+                device,
+                amp_dtype,
+                generator,
+            )[1:]
+            token_batches = [tokens]
+        elif snapshot.trainer == "dlm":
+            chunk_size = min(max(1, args.sampling_batch_size), args.samples_per_prompt - sample_index)
+            generator.manual_seed(args.seed + sample_index)
+            token_batches = sample_dlm(
+                snapshot.model,
+                snapshot.args,
+                args.max_new_tokens,
+                args.temperature,
+                args.top_k,
+                device,
+                amp_dtype,
+                generator,
+                args.dlm_sampler,
+                args.num_sampling_steps,
+                args.sampling_eps,
+                batch_size=chunk_size,
+            )
+        else:
+            raise NotImplementedError(f"Unsupported trainer for sampling: {snapshot.trainer!r}")
+
+        for offset, tokens in enumerate(token_batches):
+            current_index = sample_index + offset
+            local_seed = args.seed + current_index
+            text = tokenizer.decode(tokens)
+            rows.append(
+                {
+                    "prompt_index": 0,
+                    "sample_index": current_index,
+                    "seed": local_seed,
+                    "trainer": snapshot.trainer,
+                    "protocol": "unconditional",
+                    "sample_mode": "unconditional",
+                    "checkpoint": checkpoint_label(args.snapshot_path),
+                    "checkpoint_variant": snapshot.checkpoint_variant,
+                    "prompt": "",
+                    "generated_text": text,
+                    "target_text": text,
+                    "full_text": text,
+                    "max_new_tokens": args.max_new_tokens,
+                    "temperature": args.temperature,
+                    "top_k": args.top_k,
+                    "dlm_sampler": reported_dlm_sampler,
+                    "num_sampling_steps": args.num_sampling_steps if snapshot.trainer == "dlm" else 0,
+                    "sampling_eps": args.sampling_eps if snapshot.trainer == "dlm" else 0,
+                    "sampling_batch_size": chunk_size if snapshot.trainer == "dlm" else 1,
+                }
+            )
+        sample_index += chunk_size
+        elapsed = time.perf_counter() - generation_start
+        timing(
+            "sample_progress",
+            elapsed,
+            samples=sample_index,
+            total=args.samples_per_prompt,
+            chunk_size=chunk_size,
+            last_chunk_seconds=f"{time.perf_counter() - chunk_start:.3f}",
+            avg_sample_seconds=f"{elapsed / sample_index:.3f}",
+        )
+    timing("sample_generation_total", time.perf_counter() - generation_start, samples=args.samples_per_prompt)
+
+    payload = {
+        "snapshot": checkpoint_label(args.snapshot_path),
+        "trainer": snapshot.trainer,
+        "checkpoint_variant": snapshot.checkpoint_variant,
+        "sample_mode": "unconditional",
+        "samples": rows,
+    }
+    if args.output_json:
+        write_start = time.perf_counter()
+        output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(payload, indent=2))
+        print(f"Wrote {output_json}")
+        timing("write_json", time.perf_counter() - write_start)
+    else:
+        print(json.dumps(payload, indent=2))
+    if args.output_md:
+        write_start = time.perf_counter()
+        output_md = Path(args.output_md)
+        output_md.parent.mkdir(parents=True, exist_ok=True)
+        write_markdown(rows, output_md)
+        print(f"Wrote {output_md}")
+        timing("write_markdown", time.perf_counter() - write_start)
+    timing("total", time.perf_counter() - total_start)
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== speedrun_dlm/score_generation_quality.py =====
+import argparse
+import csv
+import json
+import math
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = PACKAGE_ROOT.parent
+
+# Release gate settings passed through to _quality_metrics.
+ORDER_CONTRAST = {
+    "pairs_per_sample": 8,
+    "distractors": 4,
+    "context_sentences": 3,
+    "min_sentence_tokens": 5,
+    "max_sentence_tokens": 80,
+    "seed": 1337,
+    "distractor_fineweb_count": 128,
+    "distractor_seed": 4242,
+}
+DOCUMENT_COHERENCE = {
+    "min_sentences": 5,
+    "max_sentences": 12,
+    "max_sentence_tokens": 80,
+    "shuffles": 1,
+    "swaps": 1,
+    "replacements": 1,
+    "block_replacements": 1,
+    "tail_splices": 1,
+    "replacement_sentences": 2,
+    "block_sentences": 3,
+    "seed": 2027,
+}
+
+UNCONDITIONAL_PRESET: dict[str, float] = {
+    "min_tokens": 500,
+    "max_repeat_3gram": 0.12,
+    "max_repeat_4gram": 0.08,
+    "min_unique": 0.25,
+    "min_compression": 0.30,
+    "max_compression": 0.75,
+    "max_token_run": 6,
+    "max_eot": 6,
+    "max_mask": 0,
+    "max_bad": 0,
+}
+
+
+def as_float(value: Any) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out
+
+
+def finite(value: float) -> bool:
+    return not math.isnan(value) and not math.isinf(value)
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def binom_tail_ge(n: int, x: int, p0: float) -> float:
+    total = 0.0
+    for k in range(x, n + 1):
+        total += math.comb(n, k) * (p0**k) * ((1.0 - p0) ** (n - k))
+    return min(1.0, max(0.0, total))
+
+
+def deterministic_pass(row: dict[str, str], rule: dict[str, Any]) -> bool:
+    preset = dict(UNCONDITIONAL_PRESET)
+    preset["max_bad"] = float(rule["max_bad_char_count"])
+    checks = [
+        ("whitespace_token_count", ">=", preset["min_tokens"]),
+        ("repeat_trigram_ratio", "<=", preset["max_repeat_3gram"]),
+        ("repeat_4gram_ratio", "<=", preset["max_repeat_4gram"]),
+        ("unique_token_ratio", ">=", preset["min_unique"]),
+        ("compression_ratio", ">=", preset["min_compression"]),
+        ("compression_ratio", "<=", preset["max_compression"]),
+        ("max_token_run", "<=", preset["max_token_run"]),
+        ("eot_count", "<=", preset["max_eot"]),
+        ("mask_token_count", "<=", preset["max_mask"]),
+        ("bad_char_count", "<=", preset["max_bad"]),
+    ]
+    for metric, op, threshold in checks:
+        value = as_float(row.get(metric))
+        if not finite(value):
+            return False
+        if op == ">=" and value < float(threshold):
+            return False
+        if op == "<=" and value > float(threshold):
+            return False
+    return True
+
+
+def sample_pass(row: dict[str, str], rule: dict[str, Any]) -> bool:
+    if row.get("protocol") != "unconditional":
+        return False
+    if not deterministic_pass(row, rule):
+        return False
+
+    bpb = as_float(row.get("ref_bpb"))
+    if not finite(bpb) or bpb > float(rule["bpb_threshold"]):
+        return False
+
+    pair_count = as_float(row.get("order_pair_count"))
+    order_acc = as_float(row.get("order_contrast_acc"))
+    if not finite(pair_count) or pair_count < float(rule["order_min_pairs"]):
+        return False
+    if not finite(order_acc) or order_acc < float(rule["order_contrast_acc_threshold"]):
+        return False
+
+    doc_count = as_float(row.get("doc_coherence_corruption_count"))
+    doc_margin = as_float(row.get("doc_coherence_margin_bpb_median"))
+    if not finite(doc_count) or doc_count < float(rule["doc_coherence_min_corruptions"]):
+        return False
+    if not finite(doc_margin) or doc_margin < float(rule["doc_coherence_margin_threshold"]):
+        return False
+    return True
+
+
+def timing(stage: str, seconds: float, **fields: Any) -> None:
+    suffix = "".join(f" {key}={value}" for key, value in fields.items())
+    print(f"TIMING score_generation_quality.{stage} seconds={seconds:.3f}{suffix}", flush=True)
+
+
+def run_command(command: list[str], cwd: Path, stage: str) -> float:
+    print("+ " + " ".join(command), flush=True)
+    start = time.perf_counter()
+    subprocess.run(command, cwd=cwd, check=True)
+    elapsed = time.perf_counter() - start
+    timing(stage, elapsed)
+    return elapsed
+
+
+def generate_panel(
+    checkpoint_path: str,
+    output_dir: Path,
+    tokens: int,
+    samples: int,
+    temperature: float,
+    top_k: int,
+    seed: int,
+    dlm_sampler: str,
+    checkpoint_variant: str,
+    amp_dtype: str,
+    num_sampling_steps: int,
+    sampling_eps: float,
+    sampling_batch_size: int,
+) -> Path:
+    if not checkpoint_path:
+        raise ValueError("Pass a checkpoint path, or provide --panel_json to score existing samples.")
+    checkpoint = Path(checkpoint_path).resolve()
+    checkpoint_label = checkpoint.name or checkpoint_path
+    samples_dir = output_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    sample_json = samples_dir / "unconditional_samples.json"
+    command = [
+        sys.executable,
+        "-m",
+        "speedrun_dlm.sample_text",
+        str(checkpoint),
+        "--max_new_tokens",
+        str(tokens),
+        "--samples_per_prompt",
+        str(samples),
+        "--temperature",
+        str(temperature),
+        "--top_k",
+        str(top_k),
+        "--seed",
+        str(seed),
+        "--dlm_sampler",
+        dlm_sampler,
+        "--checkpoint_variant",
+        checkpoint_variant,
+        "--amp_dtype",
+        amp_dtype,
+        "--num_sampling_steps",
+        str(num_sampling_steps),
+        "--sampling_eps",
+        str(sampling_eps),
+        "--sampling_batch_size",
+        str(sampling_batch_size),
+        "--output_json",
+        str(sample_json),
+        "--output_md",
+        str(output_dir / "samples.md"),
+    ]
+    sample_seconds = run_command(command, REPO_ROOT, "sample_text")
+    panel_json = output_dir / "panel.json"
+    panel_json.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "description": "Generation-quality gate panel generated from a checkpoint.",
+                "panels": [
+                    {
+                        "name": "checkpoint_unconditional",
+                        "family": "candidate",
+                        "protocol": "unconditional",
+                        "sample_path": str(sample_json.relative_to(output_dir)),
+                        "source_path": checkpoint_label,
+                        "subjective_tier": None,
+                        "gate_label": "candidate_pass",
+                    }
+                ],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    timing("generate_panel_total", sample_seconds)
+    return panel_json
+
+
+def score_panel(
+    panel_json: Path,
+    output_dir: Path,
+    reference_model: str,
+    dtype: str,
+    max_eval_tokens: int,
+    score_batch_size: int,
+    reference_device_map: str,
+    allow_fineweb_fallback: bool,
+) -> Path:
+    command = [
+        sys.executable,
+        "-m",
+        "speedrun_dlm._quality_metrics",
+        str(panel_json),
+        "--output_dir",
+        str(output_dir / "scores"),
+        "--reference_models",
+        reference_model,
+        "--dtype",
+        dtype,
+        "--max_eval_tokens",
+        str(max_eval_tokens),
+        "--score_batch_size",
+        str(score_batch_size),
+        *(["--device_map", reference_device_map] if reference_device_map else []),
+        "--order_contrast",
+        "--order_contrast_pairs_per_sample",
+        str(ORDER_CONTRAST["pairs_per_sample"]),
+        "--order_contrast_distractors",
+        str(ORDER_CONTRAST["distractors"]),
+        "--order_contrast_context_sentences",
+        str(ORDER_CONTRAST["context_sentences"]),
+        "--order_contrast_min_sentence_tokens",
+        str(ORDER_CONTRAST["min_sentence_tokens"]),
+        "--order_contrast_max_sentence_tokens",
+        str(ORDER_CONTRAST["max_sentence_tokens"]),
+        "--order_contrast_seed",
+        str(ORDER_CONTRAST["seed"]),
+        "--order_contrast_distractor_source",
+        "fineweb_controls",
+        "--order_contrast_distractor_fineweb_count",
+        str(ORDER_CONTRAST["distractor_fineweb_count"]),
+        "--order_contrast_distractor_seed",
+        str(ORDER_CONTRAST["distractor_seed"]),
+        "--document_coherence",
+        "--doc_coherence_min_sentences",
+        str(DOCUMENT_COHERENCE["min_sentences"]),
+        "--doc_coherence_max_sentences",
+        str(DOCUMENT_COHERENCE["max_sentences"]),
+        "--doc_coherence_max_sentence_tokens",
+        str(DOCUMENT_COHERENCE["max_sentence_tokens"]),
+        "--doc_coherence_shuffles",
+        str(DOCUMENT_COHERENCE["shuffles"]),
+        "--doc_coherence_swaps",
+        str(DOCUMENT_COHERENCE["swaps"]),
+        "--doc_coherence_replacements",
+        str(DOCUMENT_COHERENCE["replacements"]),
+        "--doc_coherence_block_replacements",
+        str(DOCUMENT_COHERENCE["block_replacements"]),
+        "--doc_coherence_tail_splices",
+        str(DOCUMENT_COHERENCE["tail_splices"]),
+        "--doc_coherence_replacement_sentences",
+        str(DOCUMENT_COHERENCE["replacement_sentences"]),
+        "--doc_coherence_block_sentences",
+        str(DOCUMENT_COHERENCE["block_sentences"]),
+        "--doc_coherence_seed",
+        str(DOCUMENT_COHERENCE["seed"]),
+    ]
+    if allow_fineweb_fallback:
+        command.append("--allow_fineweb_fallback")
+    run_command(command, REPO_ROOT, "quality_metrics")
+    return output_dir / "scores" / "sample_scores.csv"
+
+
+def summarize_scores(
+    sample_scores: Path,
+    output_dir: Path,
+    rule: dict[str, Any],
+    reference_model: str,
+    require_significance: bool,
+    sample_seed: int | None,
+    temperature: float | None,
+    top_k: int | None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    rows = [
+        row
+        for row in read_csv(sample_scores)
+        if row.get("reference_model") == reference_model and row.get("protocol") == "unconditional"
+    ]
+    if not rows:
+        raise ValueError(f"No unconditional rows found for reference model {reference_model!r}.")
+
+    summaries: list[dict[str, Any]] = []
+    passed = 0
+    for row in rows:
+        ok = sample_pass(row, rule)
+        passed += int(ok)
+        summaries.append(
+            {
+                "sample_id": row.get("sample_id", row.get("sample_index", "")),
+                "protocol": row.get("protocol", ""),
+                "reference_model": reference_model,
+                "pass": int(ok),
+                "ref_bpb": row.get("ref_bpb", ""),
+                "order_contrast_acc": row.get("order_contrast_acc", ""),
+                "doc_coherence_margin_bpb_median": row.get("doc_coherence_margin_bpb_median", ""),
+                "repeat_trigram_ratio": row.get("repeat_trigram_ratio", ""),
+                "bad_char_count": row.get("bad_char_count", ""),
+            }
+        )
+
+    total = len(rows)
+    pass_rate = passed / total
+    threshold = float(rule["pass_rate_threshold"])
+    p_value = binom_tail_ge(total, passed, threshold)
+    significance_pass = not require_significance or p_value < float(rule["significance_p_value"])
+    overall_pass = pass_rate >= threshold and significance_pass
+    write_csv(output_dir / "sample_passes.csv", summaries)
+
+    lines = [
+        "# Quality Gate Result",
+        "",
+        f"- reference model: `{reference_model}`",
+        f"- sampling seed: `{sample_seed}`"
+        if sample_seed is not None
+        else "- sampling seed: `not applicable (precomputed panel)`",
+        f"- sampling temperature: `{temperature}`"
+        if temperature is not None
+        else "- sampling temperature: `not applicable (precomputed panel)`",
+        f"- sampling top_k: `{top_k}`"
+        if top_k is not None
+        else "- sampling top_k: `not applicable (precomputed panel)`",
+        f"- samples: `{total}`",
+        f"- passing samples: `{passed}`",
+        f"- pass rate: `{pass_rate:.4f}`",
+        f"- required pass rate: `{threshold:.4f}`",
+        f"- exact binomial p-value vs threshold: `{p_value:.6g}`",
+        f"- significance required: `{require_significance}`",
+        f"- overall pass: `{overall_pass}`",
+        "",
+        "## Rule",
+        "",
+        f"- surface filters: `whitespace_token_count >= {UNCONDITIONAL_PRESET['min_tokens']}`, "
+        f"`repeat_trigram_ratio <= {UNCONDITIONAL_PRESET['max_repeat_3gram']}`, "
+        f"`repeat_4gram_ratio <= {UNCONDITIONAL_PRESET['max_repeat_4gram']}`, "
+        f"`unique_token_ratio >= {UNCONDITIONAL_PRESET['min_unique']}`, "
+        f"`compression_ratio` in `[{UNCONDITIONAL_PRESET['min_compression']}, {UNCONDITIONAL_PRESET['max_compression']}]`, "
+        f"`max_token_run <= {UNCONDITIONAL_PRESET['max_token_run']}`, "
+        f"`eot_count <= {UNCONDITIONAL_PRESET['max_eot']}`, "
+        f"`mask_token_count <= {UNCONDITIONAL_PRESET['max_mask']}`",
+        f"- BPB: `ref_bpb <= {rule['bpb_threshold']}`",
+        f"- order contrast: `order_pair_count >= {rule['order_min_pairs']}` "
+        f"and `order_contrast_acc >= {rule['order_contrast_acc_threshold']}`",
+        f"- document coherence: `doc_coherence_corruption_count >= {rule['doc_coherence_min_corruptions']}` "
+        f"and `doc_coherence_margin_bpb_median >= {rule['doc_coherence_margin_threshold']}`",
+        f"- bad characters: `bad_char_count <= {rule['max_bad_char_count']}`",
+    ]
+    (output_dir / "README.md").write_text("\n".join(lines) + "\n")
+    return overall_pass, summaries
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate unconditional samples from a checkpoint and apply the v0 quality gate.")
+    parser.add_argument("checkpoint", nargs="?", default="", help="Checkpoint to sample. Omit when using --panel_json.")
+    parser.add_argument("--panel_json", default="", help="Existing panel JSON to score instead of sampling a checkpoint.")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--rule_json", default=str(REPO_ROOT / "generation_quality_rule.json"))
+    parser.add_argument("--reference_model", default="")
+    parser.add_argument("--require_significance", action="store_true")
+    parser.add_argument("--samples", type=int, default=128)
+    parser.add_argument("--tokens", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--dlm_sampler",
+        default="auto",
+        help="DLM sampler name, e.g. subs_mask_ancestral, d3pm_mask_ancestral, sedd_analytic, duo_psi_rescale.",
+    )
+    parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
+    parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
+    parser.add_argument("--num_sampling_steps", type=int, default=1000)
+    parser.add_argument("--sampling_eps", type=float, default=1e-5)
+    parser.add_argument(
+        "--sampling_batch_size",
+        type=int,
+        default=1,
+        help="Number of unconditional DLM samples to generate per batch; AR checkpoints ignore this.",
+    )
+    parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--max_eval_tokens", type=int, default=4096)
+    parser.add_argument("--score_batch_size", type=int, default=4)
+    parser.add_argument(
+        "--reference_device_map",
+        default="",
+        help="Optional Hugging Face device_map for sharded reference-model scoring.",
+    )
+    parser.add_argument("--allow_fineweb_fallback", action="store_true")
+    args = parser.parse_args()
+
+    total_start = time.perf_counter()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rule = json.loads(Path(args.rule_json).read_text())
+    reference_model = args.reference_model or rule["candidate_reference_model"]
+
+    panel_json = (
+        Path(args.panel_json).resolve()
+        if args.panel_json
+        else generate_panel(
+            args.checkpoint,
+            output_dir,
+            args.tokens,
+            args.samples,
+            args.temperature,
+            args.top_k,
+            args.seed,
+            args.dlm_sampler,
+            args.checkpoint_variant,
+            args.amp_dtype,
+            args.num_sampling_steps,
+            args.sampling_eps,
+            args.sampling_batch_size,
+        )
+    )
+    sample_scores = score_panel(
+        panel_json,
+        output_dir,
+        reference_model,
+        args.dtype,
+        args.max_eval_tokens,
+        args.score_batch_size,
+        args.reference_device_map,
+        args.allow_fineweb_fallback,
+    )
+    summarize_start = time.perf_counter()
+    passed, _ = summarize_scores(
+        sample_scores,
+        output_dir,
+        rule,
+        reference_model,
+        require_significance=args.require_significance,
+        sample_seed=None if args.panel_json else args.seed,
+        temperature=None if args.panel_json else args.temperature,
+        top_k=None if args.panel_json else args.top_k,
+    )
+    timing("summarize_scores", time.perf_counter() - summarize_start)
+    print(f"QUALITY_GATE_RESULT pass={str(passed).lower()} report={output_dir / 'README.md'}", flush=True)
+    timing("total", time.perf_counter() - total_start)
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== speedrun_dlm/measure_inference_cost.py =====
+import argparse
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from .checkpoint_utils import load_snapshot, resolve_amp_dtype
+from .sample_text import (
+    DLM_SAMPLER_CHOICES,
+    checkpoint_objective_and_noise,
+    resolve_dlm_sampler,
+    sample_ar,
+    sample_dlm,
+)
+
+
+def checkpoint_label(path: str) -> str:
+    return Path(path).name or path
+
+
+class ForwardCounter:
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.model = model
+        self.original_forward = model.forward
+        self.calls = 0
+
+    def __enter__(self) -> "ForwardCounter":
+        def wrapped_forward(*args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            return self.original_forward(*args, **kwargs)
+
+        self.model.forward = wrapped_forward  # type: ignore[method-assign]
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.model.forward = self.original_forward  # type: ignore[method-assign]
+
+
+def cuda_sync(device: str) -> None:
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def make_generator(device: str, seed: int) -> torch.Generator:
+    generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
+    generator.manual_seed(seed)
+    return generator
+
+
+def run_one_sample(
+    snapshot,
+    tokens: int,
+    temperature: float,
+    top_k: int,
+    device: str,
+    amp_dtype: str,
+    seed: int,
+    dlm_sampler: str,
+    num_sampling_steps: int,
+    sampling_eps: float,
+) -> list[int]:
+    generator = make_generator(device, seed)
+    if snapshot.trainer == "ar":
+        return sample_ar(
+            snapshot.model,
+            [50256],
+            tokens,
+            temperature,
+            top_k,
+            device,
+            amp_dtype,
+            generator,
+        )
+    if snapshot.trainer == "dlm":
+        return sample_dlm(
+            snapshot.model,
+            snapshot.args,
+            tokens,
+            temperature,
+            top_k,
+            device,
+            amp_dtype,
+            generator,
+            dlm_sampler,
+            num_sampling_steps,
+            sampling_eps,
+        )
+    raise ValueError(f"Unsupported trainer: {snapshot.trainer!r}")
+
+
+def profiler_activities(device: str) -> list[torch.profiler.ProfilerActivity]:
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.startswith("cuda"):
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
+def profile_samples(
+    snapshot,
+    tokens: int,
+    measured_samples: int,
+    seed: int,
+    temperature: float,
+    top_k: int,
+    device: str,
+    amp_dtype: str,
+    dlm_sampler: str,
+    num_sampling_steps: int,
+    sampling_eps: float,
+) -> tuple[int, float, int]:
+    with ForwardCounter(snapshot.model) as counter:
+        cuda_sync(device)
+        start = time.perf_counter()
+        with torch.profiler.profile(
+            activities=profiler_activities(device),
+            with_flops=True,
+            profile_memory=False,
+            record_shapes=False,
+            with_stack=False,
+        ) as prof:
+            for offset in range(measured_samples):
+                run_one_sample(
+                    snapshot,
+                    tokens=tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    seed=seed + offset,
+                    dlm_sampler=dlm_sampler,
+                    num_sampling_steps=num_sampling_steps,
+                    sampling_eps=sampling_eps,
+                )
+        cuda_sync(device)
+        elapsed = time.perf_counter() - start
+    flops = int(sum(getattr(event, "flops", 0) or 0 for event in prof.key_averages()))
+    return flops, elapsed, counter.calls
+
+
+def write_markdown(payload: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# Inference Cost Measurement",
+        "",
+        f"- trainer: `{payload['trainer']}`",
+        f"- checkpoint variant: `{payload['checkpoint_variant']}`",
+        f"- parameters: `{payload['num_parameters']}`",
+        f"- non-embedding parameters: `{payload['non_embedding_parameters']}`",
+        f"- generated tokens per sample: `{payload['tokens_per_sample']}`",
+        f"- measured samples: `{payload['measured_samples']}`",
+        f"- warmup samples: `{payload['warmup_samples']}`",
+        f"- temperature: `{payload['temperature']}`",
+        f"- top_k: `{payload['top_k']}`",
+        f"- DLM sampler: `{payload['dlm_sampler']}`",
+        f"- DLM sampling steps: `{payload['dlm_sampling_steps']}`",
+        f"- DLM sampling eps: `{payload['sampling_eps']}`",
+        f"- forward calls per sample: `{payload['forward_calls_per_sample']:.6g}`",
+        f"- profiler FLOPs per sample: `{payload['profiler_flops_per_sample']:.6g}`",
+        f"- profiler TFLOPs per sample: `{payload['profiler_tflops_per_sample']:.6g}`",
+        f"- profiler FLOPs per 128-sample gate: `{payload['profiler_flops_per_128_sample_gate']:.6g}`",
+        f"- profiler FLOPs per 1024 samples: `{payload['profiler_flops_per_1024_samples']:.6g}`",
+        f"- wall seconds per sample: `{payload['wall_seconds_per_sample']:.6g}`",
+        f"- CUDA max memory MiB: `{payload['cuda_max_memory_mib']:.1f}`",
+        "",
+        "## Notes",
+        "",
+        "- FLOPs are estimated by `torch.profiler.profile(with_flops=True)` on the actual sampler path.",
+        "- The profiler only counts operators for which PyTorch reports FLOPs; keep the JSON artifact with every record.",
+        "- Warmup samples run before profiling and are not included in the reported FLOPs or wall time.",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Measure sampler inference cost for a checkpoint.")
+    parser.add_argument("snapshot_path")
+    parser.add_argument("--tokens", type=int, default=1024)
+    parser.add_argument("--measured_samples", type=int, default=1)
+    parser.add_argument("--warmup_samples", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
+    parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
+    parser.add_argument("--dlm_sampler", choices=DLM_SAMPLER_CHOICES, default="auto")
+    parser.add_argument("--num_sampling_steps", type=int, default=1000)
+    parser.add_argument("--sampling_eps", type=float, default=1e-5)
+    parser.add_argument("--output_json", default="")
+    parser.add_argument("--output_md", default="")
+    args = parser.parse_args()
+
+    device = args.device
+    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
+    snapshot = load_snapshot(args.snapshot_path, device=device, checkpoint_variant=args.checkpoint_variant)
+    reported_dlm_sampler = ""
+    if snapshot.trainer == "dlm":
+        objective, _ = checkpoint_objective_and_noise(snapshot.args)
+        reported_dlm_sampler = resolve_dlm_sampler(objective, args.dlm_sampler)
+    num_parameters = sum(p.numel() for p in snapshot.model.parameters())
+    non_embedding_parameters = sum(
+        p.numel() for name, p in snapshot.model.named_parameters() if "transformer.wte" not in name
+    )
+
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+
+    for offset in range(args.warmup_samples):
+        run_one_sample(
+            snapshot,
+            tokens=args.tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            device=device,
+            amp_dtype=amp_dtype,
+            seed=args.seed - args.warmup_samples + offset,
+            dlm_sampler=args.dlm_sampler,
+            num_sampling_steps=args.num_sampling_steps,
+            sampling_eps=args.sampling_eps,
+        )
+    cuda_sync(device)
+
+    flops, elapsed, forward_calls = profile_samples(
+        snapshot,
+        tokens=args.tokens,
+        measured_samples=args.measured_samples,
+        seed=args.seed,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        device=device,
+        amp_dtype=amp_dtype,
+        dlm_sampler=args.dlm_sampler,
+        num_sampling_steps=args.num_sampling_steps,
+        sampling_eps=args.sampling_eps,
+    )
+
+    per_sample_flops = flops / max(args.measured_samples, 1)
+    per_sample_calls = forward_calls / max(args.measured_samples, 1)
+    payload: dict[str, Any] = {
+        "snapshot": checkpoint_label(args.snapshot_path),
+        "trainer": snapshot.trainer,
+        "checkpoint_variant": snapshot.checkpoint_variant,
+        "num_parameters": int(num_parameters),
+        "non_embedding_parameters": int(non_embedding_parameters),
+        "device": device,
+        "amp_dtype": amp_dtype,
+        "tokens_per_sample": args.tokens,
+        "measured_samples": args.measured_samples,
+        "warmup_samples": args.warmup_samples,
+        "seed": args.seed,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "dlm_sampler": reported_dlm_sampler,
+        "dlm_sampling_steps": args.num_sampling_steps if snapshot.trainer == "dlm" else 0,
+        "sampling_eps": args.sampling_eps if snapshot.trainer == "dlm" else 0.0,
+        "forward_calls_total": forward_calls,
+        "forward_calls_per_sample": per_sample_calls,
+        "profiler_flops_total": flops,
+        "profiler_flops_per_sample": per_sample_flops,
+        "profiler_flops_per_1024_token_sample": per_sample_flops if args.tokens == 1024 else None,
+        "profiler_tflops_per_sample": per_sample_flops / 1e12,
+        "profiler_tflops_per_1024_token_sample": per_sample_flops / 1e12 if args.tokens == 1024 else None,
+        "profiler_flops_per_128_sample_gate": per_sample_flops * 128,
+        "profiler_flops_per_1024_samples": per_sample_flops * 1024,
+        "wall_seconds_total": elapsed,
+        "wall_seconds_per_sample": elapsed / max(args.measured_samples, 1),
+        "cuda_max_memory_mib": (
+            torch.cuda.max_memory_allocated() / (1024**2) if device.startswith("cuda") else 0.0
+        ),
+        "profiler": "torch.profiler.profile(with_flops=True)",
+        "cost_accounting_version": "v0.1-torch-profiler-actual-sampler",
+        "profiler_caveat": "PyTorch reports FLOPs only for supported operators; keep this with sampler config.",
+    }
+
+    if args.output_json:
+        output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"Wrote {output_json}")
+    else:
+        print(json.dumps(payload, indent=2))
+
+    if args.output_md:
+        output_md = Path(args.output_md)
+        output_md.parent.mkdir(parents=True, exist_ok=True)
+        write_markdown(payload, output_md)
+        print(f"Wrote {output_md}")
+
+
+if __name__ == "__main__":
+    main()
+

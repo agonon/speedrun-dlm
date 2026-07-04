@@ -1,0 +1,32 @@
+{
+  "diversity": {
+    "distinct_2_mean": null,
+    "unigram_entropy_bits_mean": null
+  },
+  "inference_cost": {
+    "checkpoint_variant": "model",
+    "cost_accounting_version": "v0.1-torch-profiler-actual-sampler",
+    "cuda_max_memory_mib": 1638.35302734375,
+    "dlm_sampler": "subs_mask_ancestral",
+    "dlm_sampling_steps": 344,
+    "forward_calls_per_sample": 326.0,
+    "measured_samples": 1,
+    "non_embedding_parameters": 131028305,
+    "num_parameters": 169626449,
+    "profiler_flops_per_1024_samples": 8.454139611297178e+16,
+    "profiler_flops_per_128_sample_gate": 1.0567674514121472e+16,
+    "profiler_flops_per_sample": 82559957141574.0,
+    "profiler_flops_total": 82559957141574,
+    "profiler_tflops_per_1024_token_sample": 82.559957141574,
+    "profiler_tflops_per_sample": 82.559957141574,
+    "sampling_eps": 0.001,
+    "seed": 1337,
+    "temperature": 1.0,
+    "tokens_per_sample": 1024,
+    "top_k": 0,
+    "trainer": "dlm",
+    "wall_seconds_per_sample": 38.41817856999114,
+    "wall_seconds_total": 38.41817856999114,
+    "warmup_samples": 1
+  }
+}

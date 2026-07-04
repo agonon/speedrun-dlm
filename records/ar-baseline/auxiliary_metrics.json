@@ -1,0 +1,43 @@
+{
+  "diversity": {
+    "distinct_2_mean": null,
+    "unigram_entropy_bits_mean": null
+  },
+  "inference_cost": {
+    "amp_dtype": "bfloat16",
+    "checkpoint_variant": "model",
+    "cost_accounting_version": "v0.1-torch-profiler-actual-sampler",
+    "cuda_max_memory_mib": 566.529296875,
+    "device": "cuda",
+    "dlm_sampling_steps": 0,
+    "forward_calls_per_sample": 1024.0,
+    "forward_calls_total": 1024,
+    "mdlm_sampling_eps": 0.0,
+    "measured_samples": 1,
+    "profiler": "torch.profiler.profile(with_flops=True)",
+    "profiler_caveat": "PyTorch reports FLOPs only for supported operators; keep this with sampler config.",
+    "profiler_flops_per_1024_samples": 9.138854687093555e+16,
+    "profiler_flops_per_1024_token_sample": 89246627803648.0,
+    "profiler_flops_per_128_sample_gate": 1.1423568358866944e+16,
+    "profiler_flops_per_sample": 89246627803648.0,
+    "profiler_flops_total": 89246627803648,
+    "profiler_tflops_per_1024_token_sample": 89.246627803648,
+    "profiler_tflops_per_sample": 89.246627803648,
+    "kv_cache_profiler_tflops_per_1024_token_sample": 0.253032948736,
+    "kv_cache_profiler_flops_per_1024_token_sample": 253032948736.0,
+    "kv_cache_cached_decode_steps_per_sample": 1024,
+    "kv_cache_generated_eot_counts": [2],
+    "kv_cache_first_generated_eot_position": [89],
+    "kv_cache_stop_on_eot": false,
+    "kv_cache_cost_accounting_version": "v0.1-torch-profiler-ar-kv-cache",
+    "seed": 141421,
+    "snapshot": "records://ar-baseline/checkpoints/seed-1/final.pt",
+    "temperature": 1.0,
+    "tokens_per_sample": 1024,
+    "top_k": 200,
+    "trainer": "ar",
+    "wall_seconds_per_sample": 46.547071976587176,
+    "wall_seconds_total": 46.547071976587176,
+    "warmup_samples": 1
+  }
+}

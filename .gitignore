@@ -1,0 +1,15 @@
+# Local/private workspace
+.private/
+.venv/
+.DS_Store
+
+# Python/cache noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime outputs and downloaded token shards
+results/
+.cache/
+fineweb10B/
+pylog124M/

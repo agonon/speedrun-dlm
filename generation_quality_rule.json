@@ -1,0 +1,24 @@
+{
+  "version": "v0-strict-doccoh",
+  "candidate_reference_model": "Qwen/Qwen2.5-7B",
+  "pinned_reference_model": "d149729398750b98c0af14eb82c78cfe92750796",
+  "deterministic_preset": "medium",
+  "bpb_threshold": 2.1,
+  "pass_rate_threshold": 0.75,
+  "max_bad_char_count": 0.0,
+  "order_protocols": [
+    "unconditional"
+  ],
+  "order_min_pairs": 4.0,
+  "order_contrast_acc_threshold": 0.375,
+  "order_contrast_margin_threshold": null,
+  "order_shuffle_acc_threshold": null,
+  "doc_coherence_protocols": [
+    "unconditional"
+  ],
+  "doc_coherence_min_corruptions": 5.0,
+  "doc_coherence_win_rate_threshold": null,
+  "doc_coherence_margin_threshold": -0.2,
+  "doc_coherence_kind_margin_thresholds": {},
+  "significance_p_value": 0.01
+}

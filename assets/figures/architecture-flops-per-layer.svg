@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="475" viewBox="0 0 1000 475" role="img">
+<defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1f2933; }
+.title { font-size: 26px; font-weight: 700; }
+.subtitle { font-size: 14px; fill: #5b6773; }
+.label { font-size: 14px; font-weight: 600; }
+.small { font-size: 12px; fill: #5b6773; }
+.tiny { font-size: 11px; fill: #5b6773; }
+.mono { font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2933; }
+.value { font-size: 13px; font-weight: 650; }
+</style>
+<pattern id="diag" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+<rect width="8" height="8" fill="#edf1f5"/>
+<line x1="0" y1="0" x2="0" y2="8" stroke="#8b96a3" stroke-width="3"/>
+</pattern>
+</defs>
+<rect x="0" y="0" width="1000" height="475" fill="#ffffff"/>
+<text x="40.0" y="48.0" text-anchor="start" class="title">Per-block FLOPs</text>
+<text x="40.0" y="75.0" text-anchor="start" class="subtitle">Measured: nn.Linear via torch.profiler. Estimated: SDPA by formula.</text>
+<text x="40.0" y="112.0" text-anchor="start" class="label">Measured nn.Linear FLOPs</text>
+<text x="170.0" y="160.0" text-anchor="end" class="label">nanoGPT-2 block</text>
+<rect x="220.0" y="136.0" width="88.7" height="36.0" fill="#f28e2b"/>
+<text x="264.4" y="159.0" text-anchor="middle" class="value" style="fill: #ffffff">2.5T</text>
+<rect x="308.7" y="136.0" width="177.5" height="36.0" fill="#59a14f"/>
+<text x="397.5" y="159.0" text-anchor="middle" class="value" style="fill: #ffffff">5.0T</text>
+<rect x="220.0" y="136.0" width="266.2" height="36.0" fill="none" stroke="#1f2933"/>
+<text x="664.0" y="160.0" text-anchor="start" class="value">7.43 TF</text>
+<text x="170.0" y="218.0" text-anchor="end" class="label">DDiT block</text>
+<rect x="220.0" y="194.0" width="107.7" height="36.0" fill="#f28e2b"/>
+<text x="273.8" y="217.0" text-anchor="middle" class="value" style="fill: #ffffff">3.0T</text>
+<rect x="327.7" y="194.0" width="215.4" height="36.0" fill="#59a14f"/>
+<text x="435.4" y="217.0" text-anchor="middle" class="value" style="fill: #ffffff">6.0T</text>
+<rect x="220.0" y="194.0" width="323.1" height="36.0" fill="none" stroke="#1f2933"/>
+<text x="664.0" y="218.0" text-anchor="start" class="value">9.02 TF</text>
+<rect x="220.0" y="238.0" width="14.0" height="14.0" fill="#f28e2b"/>
+<text x="240.0" y="249.0" text-anchor="start" class="small">c_attn(x), c_proj(y)</text>
+<rect x="408.0" y="238.0" width="14.0" height="14.0" fill="#59a14f"/>
+<text x="428.0" y="249.0" text-anchor="start" class="small">MLP linears</text>
+<rect x="533.0" y="238.0" width="14.0" height="14.0" fill="#b07aa1"/>
+<text x="553.0" y="249.0" text-anchor="start" class="small">adaLN</text>
+<line x1="40.0" y1="280.0" x2="960.0" y2="280.0" stroke="#edf1f5" stroke-width="2.0"/>
+<text x="40.0" y="316.0" text-anchor="start" class="label">Estimated SDPA FLOPs</text>
+<text x="170.0" y="373.0" text-anchor="end" class="label">nanoGPT-2 causal</text>
+<rect x="220.0" y="350.0" width="98.8" height="36.0" fill="url(#diag)" stroke="#1f2933"/>
+<text x="332.8" y="373.0" text-anchor="start" class="value">0.55 TF</text>
+<text x="170.0" y="431.0" text-anchor="end" class="label">DDiT non-causal</text>
+<rect x="220.0" y="408.0" width="359.0" height="36.0" fill="url(#diag)" stroke="#1f2933"/>
+<text x="593.0" y="431.0" text-anchor="start" class="value">2.00 TF</text>
+<rect x="745.0" y="122.0" width="205.0" height="225.0" fill="#edf1f5"/>
+<text x="762.0" y="148.0" text-anchor="start" class="label">torch.profiler</text>
+<text x="762.0" y="171.0" text-anchor="start" class="mono">qkv = c_attn(x)</text>
+<text x="762.0" y="190.0" text-anchor="start" class="mono">y = c_proj(y)</text>
+<text x="762.0" y="209.0" text-anchor="start" class="mono">MLP, adaLN</text>
+<text x="762.0" y="246.0" text-anchor="start" class="label">SDPA estimate</text>
+<text x="762.0" y="269.0" text-anchor="start" class="tiny">4 x B x H x P x d_h</text>
+<text x="762.0" y="291.0" text-anchor="start" class="tiny">P = T(T+1)/2 causal</text>
+<text x="762.0" y="311.0" text-anchor="start" class="tiny">P = T^2 non-causal</text>
+<text x="762.0" y="334.0" text-anchor="start" class="tiny">SDPA shown analytically</text>
+</svg>

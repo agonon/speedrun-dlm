@@ -1,0 +1,11 @@
+.git/
+.private/
+.venv/
+.cache/
+__pycache__/
+*.pyc
+.DS_Store
+
+fineweb10B/
+pylog124M/
+results/
