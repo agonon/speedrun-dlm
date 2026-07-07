@@ -8,19 +8,6 @@ This appendix provides a few extra details about the code.
 - `dlm`: small shared DDiT backbone used for all DLM objectives and samplers ([model](speedrun_dlm/train_dlm.py)).
 - `ar`: nanoGPT-2 causal transformer ([model](speedrun_dlm/train_ar.py), purely for reference).
 
-The public AR sampler has no KV cache ([sampler](speedrun_dlm/sample_text.py)). The cached AR number in the leaderboard was profiled separately on H100 80GB GPUs.
-
-The README explains the model setup. In short, DDiT starts from the nanoGPT-2 shape and makes the usual DLM changes:
-
-- non-causal attention,
-- time conditioning,
-- untied input and output embeddings.
-
-The README figures for parameters and FLOPs are made with:
-
-```bash
-python assets/figures/make_architecture_plots.py
-```
 
 For reference, these are the DDiT parts we match. The code here is our own re-implementation, so any mistake is ours.
 
@@ -34,9 +21,9 @@ For reference, these are the DDiT parts we match. The code here is our own re-im
 
 ## DLM objectives
 
-`run_dlm.sh` uses `subs_mask` by default. Other objectives can be selected with `--objective`. 
+`run_dlm.sh` uses `subs_mask` by default. Other objectives can be selected with `--objective`.
 
-When no schedule or time-conditioning flag is passed, the trainer uses the local default for that objective. 
+When no schedule or time-conditioning flag is passed, the trainer uses the local default for that objective.
 
 The implementations are in [`train_dlm.py`](speedrun_dlm/train_dlm.py).
 
@@ -67,6 +54,32 @@ Sampler names are listed in [`sample_text.py`](speedrun_dlm/sample_text.py).
 | SEDD | [SEDD](https://arxiv.org/abs/2310.16834) | `sedd_euler`, `sedd_analytic` |
 | DUO | [DUO](https://arxiv.org/abs/2506.10892), [Psi samplers](https://arxiv.org/abs/2602.21185) | `duo_ancestral`, `duo_greedy_tail`, `duo_psi_rescale`, `duo_psi_capped`, `duo_psi_loop` |
 
+
+## DDiT and AR reference
+
+The benchmark fixes a small DDiT backbone at roughly nanoGPT-2 scale, diffusion-specific changes on top. The nanoGPT-2 reference comes from the first commit of the repository [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), yielding the code in `speedrun_dlm/train_ar.py` (up to minor changes).
+We then adapted it to diffusion language models in `speedrun_dlm/train_dlm.py`.
+
+Compared with the AR reference, DDiT adds parameters mainly through the untied output head. The time embedding and adaptive layer norm add much less.
+
+![nanoGPT-2 vs DDiT total parameters](assets/figures/architecture-params-total.svg)
+
+As a reference point, `train_ar.py` reaches the gate in **40.6s** on average over 50 seeds. It passes **49 out of 50 seeds** under the current gate (the failed seed has 106 passing samples out of 128, below the required 108). This AR run is not part of the DLM leaderboard, but the record artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
+
+One of the main promises of DLMs is lower inference cost: as they can generate many tokens in parallel, they may use fewer model calls than the sequence length. However, the cost of each call matters too. Compared with KV-cached AR generation, DLMs face two main sources of extra FLOPs. First, the use of a KV-cache is in general not possible, so the attention cost remains quadratic in the length of the block being denoised instead of becoming linear. Second, bidirectional attention doubles the attention pairs and the number of token positions processed by each linear layer compared with a causal forward pass.
+
+In this benchmark, our DDiT samplers do not use KV caching. This is delicate in general: for instance, under uniform diffusion, the same token can be revised several times, so cached states would need to be updated as the sequence changes. We therefore compare against the uncached nanoGPT-2 AR reference, whose cost for generating one 1024-token sample is 95.86 TFLOPs, and use this as the submission cap.
+
+This should not be read as saying that caching is unimportant for DLMs. Quite the opposite: the same AR reference drops from 95.86 TFLOPs uncached to 0.27 TFLOPs with KV cache, a roughly 350x reduction. Diffusion variants compatible with KV caching, like block diffusion, are therefore very promising directions. Here, we focus on what can be achieved in the single-block setting.
+
+More details: [per-block compute](assets/figures/architecture-flops-per-layer.svg), [cost accounting](assets/figures/architecture-additional-flops.svg).
+
+
+The figures are made with:
+
+```bash
+python assets/figures/make_architecture_plots.py
+```
 
 ## Inference cost accounting
 

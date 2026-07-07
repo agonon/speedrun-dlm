@@ -10,11 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = ROOT / "assets" / "figures"
 AR_COST = ROOT / "records" / "ar-baseline" / "auxiliary_metrics.json"
-DDIT_ARCHITECTURE_COST = {
-    "forward_calls_per_sample": 622.0,
-    "num_parameters": 169_626_449,
-    "profiler_tflops_per_1024_token_sample": 157.557743865198,
-}
+DLM_COST = ROOT / "records" / "0001-subs-mask-s344" / "auxiliary_metrics.json"
 AR_NUM_PARAMETERS = 124_318_464
 
 SEQ = 1024
@@ -46,7 +42,7 @@ def load_ar_cost() -> dict:
 
 
 def load_ddit_architecture_cost() -> dict:
-    return DDIT_ARCHITECTURE_COST
+    return load_cost(DLM_COST)
 
 
 def esc(value: object) -> str:
@@ -152,96 +148,6 @@ def attention_score_value_estimate(backend: str) -> float:
     if backend == "ddit":
         return 4 * D_MODEL * ddit_calls * SEQ * SEQ / 1e12
     raise ValueError(backend)
-
-
-def make_params() -> None:
-    width, height = 1000, 545
-    body: list[str] = [
-        text(40, 48, "nanoGPT-2 vs DDiT parameters", "title"),
-        text(40, 75, "d12 config: 12 layers, d=768, vocab=50,257, cond_dim=128", "subtitle"),
-    ]
-
-    gpt_token = VOCAB * D_MODEL / 1e6
-    gpt_pos = SEQ * D_MODEL / 1e6
-    gpt_attn = 4 * D_MODEL * D_MODEL / 1e6
-    gpt_mlp = 8 * D_MODEL * D_MODEL / 1e6
-
-    ddit_input = (VOCAB + 1) * D_MODEL / 1e6
-    ddit_attn = gpt_attn
-    ddit_mlp = (8 * D_MODEL * D_MODEL + 5 * D_MODEL) / 1e6
-    ddit_adaln = (COND_DIM * 6 * D_MODEL + 6 * D_MODEL) / 1e6
-    ddit_norms = 2 * D_MODEL / 1e6
-    ddit_block = ddit_attn + ddit_mlp + ddit_adaln + ddit_norms
-    ddit_time = (TIME_FREQ_DIM * COND_DIM + COND_DIM + COND_DIM * COND_DIM + COND_DIM) / 1e6
-    ddit_output = (
-        D_MODEL
-        + D_MODEL * VOCAB
-        + VOCAB
-        + COND_DIM * 2 * D_MODEL
-        + 2 * D_MODEL
-    ) / 1e6
-
-    body.append(text(40, 116, "Total parameters", "label"))
-    x, bar_w, h = 220, 650, 38
-    max_total = 175.0
-    body.append(text(130, 157, "nanoGPT-2", "label", "end"))
-    stacked_bar(
-        body,
-        x,
-        132,
-        bar_w,
-        h,
-        max_total,
-        [
-            ("token emb / tied head", gpt_token, BLUE),
-            ("position emb", gpt_pos, GRAY),
-            ("12 transformer blocks", LAYERS * (gpt_attn + gpt_mlp), GREEN),
-        ],
-        unit="M",
-    )
-    body.append(text(x + bar_w + 14, 157, f"{AR_NUM_PARAMETERS / 1e6:.1f}M", "value"))
-    body.append(text(130, 214, "DDiT", "label", "end"))
-    stacked_bar(
-        body,
-        x,
-        189,
-        bar_w,
-        h,
-        max_total,
-        [
-            ("input emb", ddit_input, BLUE),
-            ("12 DDiT blocks", LAYERS * ddit_block, GREEN),
-            ("time map", ddit_time, PURPLE),
-            ("untied output layer", ddit_output, RED),
-        ],
-        unit="M",
-    )
-    body.append(text(x + bar_w + 14, 214, f"{load_ddit_architecture_cost()['num_parameters'] / 1e6:.1f}M", "value"))
-    legend(body, 220, 258, [("embeddings", BLUE), ("blocks", GREEN), ("time/conditioning", PURPLE), ("DDiT output head", RED)])
-
-    body.append(line(40, 305, 960, 305, LIGHT_GRAY, 2))
-    body.append(text(40, 350, "One transformer block", "label"))
-    x2, bar_w2 = 220, 570
-    max_layer = 8.2
-    body.append(text(130, 393, "nanoGPT-2 block", "label", "end"))
-    stacked_bar(body, x2, 368, bar_w2, h, max_layer, [("attention", gpt_attn, ORANGE), ("MLP", gpt_mlp, GREEN)], unit="M")
-    body.append(text(x2 + bar_w2 + 14, 393, f"{gpt_attn + gpt_mlp:.2f}M", "value"))
-    body.append(text(130, 450, "DDiT block", "label", "end"))
-    stacked_bar(
-        body,
-        x2,
-        425,
-        bar_w2,
-        h,
-        max_layer,
-        [("attention", ddit_attn, ORANGE), ("MLP", ddit_mlp, GREEN), ("adaLN", ddit_adaln, PURPLE), ("norms", ddit_norms, GRAY)],
-        unit="M",
-    )
-    body.append(text(x2 + bar_w2 + 14, 450, f"{ddit_block:.2f}M", "value"))
-    legend(body, 220, 494, [("attention", ORANGE), ("MLP", GREEN), ("adaLN", PURPLE), ("norms", GRAY)])
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "architecture-params-per-layer.svg").write_text(svg(width, height, body))
 
 
 def make_params_total() -> None:
@@ -507,7 +413,6 @@ def make_extra_flops() -> None:
 
 def main() -> None:
     make_params_total()
-    make_params()
     make_flops_per_layer()
     make_extra_flops()
 
