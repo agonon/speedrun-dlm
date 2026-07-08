@@ -6,6 +6,8 @@ This repository asks how quickly one can train a diffusion language model on
 *FineWeb*, using *8 H100s*, until it generates 1024-token samples that are good
 enough to pass a simple quality gate.
 
+**The leaderboard is based on generated samples passing this gate (using Gen. PPL plus additional checks for failure modes of PPL alone, like token repetition and coherence).**
+
 The **gate** checks for:
 - too much repetition,
 - basic document coherence,
@@ -29,10 +31,11 @@ We fix a small DDiT backbone (170M parameters) and include re-implementations of
 - [Run](#run)
 - [Check a candidate](#check-a-candidate)
 - [Appendix](APPENDIX.md)
+- [Acknowledgements](#acknowledgements)
 
 ## Leaderboard
 
-**Runs are ranked by training time to pass the quality gate.**
+**Runs are ranked by training time to pass the sample-quality gate.**
 
 To appear on the leaderboard, a DLM trainer+sampler must:
 - pass at least 42 out of 50 seeds, and
@@ -166,6 +169,14 @@ python -m speedrun_dlm.measure_inference_cost path/to/checkpoint.pt \
 ## Appendix
 
 **More details on objectives, samplers, architecture, and figures are in [the appendix](APPENDIX.md).**
+
+## Acknowledgements
+
+This repo builds on a lot of useful public work. In particular, we used:
+
+- [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) for the speedrun setup and AR reference,
+- [MDLM](https://github.com/kuleshov-group/mdlm), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion), [D3PM](https://github.com/google-research/google-research/tree/master/d3pm), and [DUO](https://github.com/s-sahoo/duo) for the different DLM objectives and samplers,
+- [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb), [fineweb10B-gpt2](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2), and [Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B) for the data and Gen PPL scorer.
 
 ## Cite as
 
