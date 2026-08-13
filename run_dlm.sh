@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep mounted home directories from overriding the versions installed in the
+# official container image.
+export PYTHONNOUSERSITE=1
+
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 OUTPUT_DIR=${OUTPUT_DIR:-results/dlm_run}
 DLM_OBJECTIVE="${DLM_OBJECTIVE:-${OBJECTIVE:-subs_mask}}"
@@ -31,6 +35,9 @@ DUO_ARGS=(
   --duo_curriculum_start "${DLM_DUO_CURRICULUM_START:-0}"
   --duo_curriculum_end "${DLM_DUO_CURRICULUM_END:-500000}"
 )
+
+mkdir -p "$OUTPUT_DIR"
+python3 records/capture_environment.py > "$OUTPUT_DIR/environment.json"
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_dlm \
   --model "${MODEL:-d12}" \

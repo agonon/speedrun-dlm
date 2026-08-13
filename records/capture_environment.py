@@ -98,10 +98,13 @@ def git_environment() -> dict[str, Any]:
     head = run_command(["git", "rev-parse", "HEAD"])
     branch = run_command(["git", "branch", "--show-current"])
     status = run_command(["git", "status", "--short"])
+    dirty = None
+    if status and status.get("returncode") == 0:
+        dirty = bool(status.get("stdout"))
     return {
         "head": head.get("stdout") if head and head.get("returncode") == 0 else None,
         "branch": branch.get("stdout") if branch and branch.get("returncode") == 0 else None,
-        "dirty": bool(status and status.get("stdout")),
+        "dirty": dirty,
     }
 
 

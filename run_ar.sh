@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep mounted home directories from overriding the versions installed in the
+# official container image.
+export PYTHONNOUSERSITE=1
+
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 OUTPUT_DIR=${OUTPUT_DIR:-results/ar_run}
+
+mkdir -p "$OUTPUT_DIR"
+python3 records/capture_environment.py > "$OUTPUT_DIR/environment.json"
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_ar \
   --model "${MODEL:-d12}" \
