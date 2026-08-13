@@ -137,7 +137,7 @@ for each PR.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -c constraints.txt -r requirements.txt
 
 bash prepare_data.sh
 bash run_ar.sh

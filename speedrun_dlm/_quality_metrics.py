@@ -323,7 +323,7 @@ class ReferenceLMScorer:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         load_kwargs: dict[str, Any] = {
-            "torch_dtype": torch_dtype,
+            "dtype": torch_dtype,
             "trust_remote_code": trust_remote_code,
         }
         if pinned_reference_model:
