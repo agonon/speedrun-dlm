@@ -1,7 +1,9 @@
 import argparse
 import csv
+import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 import time
@@ -11,6 +13,15 @@ from typing import Any
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent
+SEED_PROTOCOL = "checkpoint-sha256-v1"
+SEED_PURPOSES = (
+    "sampling",
+    "inference_cost",
+    "order_contrast",
+    "fineweb_controls",
+    "document_coherence",
+)
+EVAL_SEED_MODULUS = 2**63
 
 # Release gate settings passed through to _quality_metrics.
 ORDER_CONTRAST = {
@@ -19,9 +30,7 @@ ORDER_CONTRAST = {
     "context_sentences": 3,
     "min_sentence_tokens": 5,
     "max_sentence_tokens": 80,
-    "seed": 1337,
     "distractor_fineweb_count": 128,
-    "distractor_seed": 4242,
 }
 DOCUMENT_COHERENCE = {
     "min_sentences": 5,
@@ -34,7 +43,6 @@ DOCUMENT_COHERENCE = {
     "tail_splices": 1,
     "replacement_sentences": 2,
     "block_sentences": 3,
-    "seed": 2027,
 }
 
 UNCONDITIONAL_PRESET: dict[str, float] = {
@@ -49,6 +57,144 @@ UNCONDITIONAL_PRESET: dict[str, float] = {
     "max_mask": 0,
     "max_bad": 0,
 }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def derive_evaluation_seed(checkpoint_sha256: str, purpose: str) -> int:
+    if purpose not in SEED_PURPOSES:
+        raise ValueError(f"Unknown evaluation seed purpose: {purpose!r}")
+    payload = f"{SEED_PROTOCOL}\0{checkpoint_sha256}\0{purpose}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % EVAL_SEED_MODULUS
+
+
+def checkpoint_evaluation_seeds(checkpoint_sha256: str) -> dict[str, int]:
+    return {purpose: derive_evaluation_seed(checkpoint_sha256, purpose) for purpose in SEED_PURPOSES}
+
+
+def load_verified_sample_manifest(
+    manifest_path: Path,
+    checkpoint_sha256: str,
+    official_sampling_batch_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a sample manifest and verify its checkpoint-derived evaluation metadata."""
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("version") != 1:
+        raise ValueError(f"Unsupported sample-manifest version in {manifest_path}")
+
+    evaluation = manifest.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError(f"Missing evaluation metadata in {manifest_path}")
+    if evaluation.get("seed_protocol") != SEED_PROTOCOL:
+        raise ValueError(f"{manifest_path} does not use {SEED_PROTOCOL}")
+    if evaluation.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(f"Checkpoint hash does not match {manifest_path}")
+
+    expected_seeds = checkpoint_evaluation_seeds(checkpoint_sha256)
+    if evaluation.get("seeds") != expected_seeds:
+        raise ValueError(f"Evaluation seeds were not derived from the checkpoint in {manifest_path}")
+    if int(evaluation.get("sampling_batch_size", -1)) != official_sampling_batch_size:
+        raise ValueError(
+            f"{manifest_path} must use official sampling batch size {official_sampling_batch_size}"
+        )
+
+    sample_sets = manifest.get("sample_sets")
+    if not isinstance(sample_sets, list) or len(sample_sets) != 1:
+        raise ValueError(f"{manifest_path} must contain exactly one sample set")
+    sample_path = manifest_path.parent / str(sample_sets[0].get("sample_path", ""))
+    if not sample_path.is_file():
+        raise FileNotFoundError(f"Sample file referenced by {manifest_path} is unavailable: {sample_path}")
+    sample_payload = json.loads(sample_path.read_text())
+    try:
+        training_seed = int(evaluation["training_seed"])
+        sample_training_seed = int(sample_payload["training_seed"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Missing integer training seed in {manifest_path} or {sample_path}") from exc
+    if sample_training_seed != training_seed:
+        raise ValueError(f"Training seed mismatch between {manifest_path} and {sample_path}")
+
+    sample_rows = sample_payload.get("samples")
+    if not isinstance(sample_rows, list) or not sample_rows:
+        raise ValueError(f"Missing samples in {sample_path}")
+    trainer = sample_payload.get("trainer")
+    if trainer not in {"ar", "dlm"}:
+        raise ValueError(f"Unsupported trainer in {sample_path}: {trainer!r}")
+    for index, row in enumerate(sample_rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Sample {index} in {sample_path} is not an object")
+        if int(row.get("sample_index", -1)) != index:
+            raise ValueError(f"Sample indices are missing, duplicated, or reordered in {sample_path}")
+        if trainer == "dlm":
+            batch_start = (index // official_sampling_batch_size) * official_sampling_batch_size
+            expected_seed = expected_seeds["sampling"] + batch_start
+            expected_batch_size = min(official_sampling_batch_size, len(sample_rows) - batch_start)
+        else:
+            expected_seed = expected_seeds["sampling"] + index
+            expected_batch_size = 1
+        if int(row.get("seed", -1)) != expected_seed:
+            raise ValueError(f"Sample {index} does not record its actual checkpoint-derived RNG seed")
+        if int(row.get("sampling_batch_size", -1)) != expected_batch_size:
+            raise ValueError(f"Sample {index} does not use the official sampling batch size")
+    return manifest, sample_payload
+
+
+def materialize_reused_samples(source_manifest: Path, output_dir: Path) -> Path:
+    """Copy reused generated samples so the new scorer output remains self-contained."""
+    manifest = json.loads(source_manifest.read_text())
+    sample_sets = manifest.get("sample_sets")
+    if not isinstance(sample_sets, list) or len(sample_sets) != 1:
+        raise ValueError(f"{source_manifest} must contain exactly one sample set")
+    relative_sample_path = Path(str(sample_sets[0].get("sample_path", "")))
+    if relative_sample_path.is_absolute() or ".." in relative_sample_path.parts:
+        raise ValueError(f"Sample path in {source_manifest} must stay inside its scorer output directory")
+    source_sample = source_manifest.parent / relative_sample_path
+    destination_sample = output_dir / relative_sample_path
+    destination_sample.parent.mkdir(parents=True, exist_ok=True)
+    if source_sample.resolve() != destination_sample.resolve():
+        shutil.copyfile(source_sample, destination_sample)
+
+    destination_manifest = output_dir / "sample_manifest.json"
+    if source_manifest.resolve() != destination_manifest.resolve():
+        shutil.copyfile(source_manifest, destination_manifest)
+    source_markdown = source_manifest.parent / "samples.md"
+    destination_markdown = output_dir / "samples.md"
+    if source_markdown.is_file() and source_markdown.resolve() != destination_markdown.resolve():
+        shutil.copyfile(source_markdown, destination_markdown)
+    return destination_manifest
+
+
+def record_scoring_provenance(
+    manifest_path: Path,
+    rule_path: Path,
+    rule: dict[str, Any],
+    reference_model: str,
+    pinned_reference_model: str,
+    args: argparse.Namespace,
+) -> None:
+    """Bind the generated samples to the exact official scoring configuration and outputs."""
+    manifest = json.loads(manifest_path.read_text())
+    output_dir = manifest_path.parent
+    manifest["scoring"] = {
+        "rule_version": rule["version"],
+        "rule_sha256": sha256_file(rule_path),
+        "reference_model": reference_model,
+        "pinned_reference_model": pinned_reference_model,
+        "dtype": args.dtype,
+        "max_eval_tokens": args.max_eval_tokens,
+        "score_batch_size": args.score_batch_size,
+        "reference_device_map": args.reference_device_map,
+        "allow_fineweb_fallback": bool(args.allow_fineweb_fallback),
+        "significance_required": bool(args.require_significance),
+        "sample_scores_sha256": sha256_file(output_dir / "scores" / "sample_scores.csv"),
+        "sample_passes_sha256": sha256_file(output_dir / "sample_passes.csv"),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def as_float(value: Any) -> float:
@@ -157,14 +303,15 @@ def run_command(command: list[str], cwd: Path, stage: str) -> float:
     return elapsed
 
 
-def generate_panel(
+def generate_sample_manifest(
     checkpoint_path: str,
+    checkpoint_sha256: str,
+    evaluation_seeds: dict[str, int],
     output_dir: Path,
     tokens: int,
     samples: int,
     temperature: float,
     top_k: int,
-    seed: int,
     dlm_sampler: str,
     checkpoint_variant: str,
     amp_dtype: str,
@@ -173,7 +320,7 @@ def generate_panel(
     sampling_batch_size: int,
 ) -> Path:
     if not checkpoint_path:
-        raise ValueError("Pass a checkpoint path, or provide --panel_json to score existing samples.")
+        raise ValueError("Pass the checkpoint whose contents determine evaluation randomness.")
     checkpoint = Path(checkpoint_path).resolve()
     checkpoint_label = checkpoint.name or checkpoint_path
     samples_dir = output_dir / "samples"
@@ -193,7 +340,7 @@ def generate_panel(
         "--top_k",
         str(top_k),
         "--seed",
-        str(seed),
+        str(evaluation_seeds["sampling"]),
         "--dlm_sampler",
         dlm_sampler,
         "--checkpoint_variant",
@@ -212,13 +359,25 @@ def generate_panel(
         str(output_dir / "samples.md"),
     ]
     sample_seconds = run_command(command, REPO_ROOT, "sample_text")
-    panel_json = output_dir / "panel.json"
-    panel_json.write_text(
+    sample_payload = json.loads(sample_json.read_text())
+    training_seed = sample_payload.get("training_seed")
+    if training_seed is None:
+        raise ValueError(f"Checkpoint {checkpoint} does not record its training seed")
+    manifest_path = output_dir / "sample_manifest.json"
+    manifest_path.write_text(
         json.dumps(
             {
                 "version": 1,
-                "description": "Generation-quality gate panel generated from a checkpoint.",
-                "panels": [
+                "description": "Generated samples and checkpoint evaluation metadata.",
+                "evaluation": {
+                    "seed_protocol": SEED_PROTOCOL,
+                    "checkpoint_path": str(checkpoint),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "training_seed": training_seed,
+                    "sampling_batch_size": sampling_batch_size,
+                    "seeds": evaluation_seeds,
+                },
+                "sample_sets": [
                     {
                         "name": "checkpoint_unconditional",
                         "family": "candidate",
@@ -234,12 +393,12 @@ def generate_panel(
         )
         + "\n"
     )
-    timing("generate_panel_total", sample_seconds)
-    return panel_json
+    timing("generate_samples_total", sample_seconds)
+    return manifest_path
 
 
-def score_panel(
-    panel_json: Path,
+def score_generated_samples(
+    manifest_path: Path,
     output_dir: Path,
     reference_model: str,
     pinned_reference_model: str,
@@ -253,7 +412,7 @@ def score_panel(
         sys.executable,
         "-m",
         "speedrun_dlm._quality_metrics",
-        str(panel_json),
+        str(manifest_path),
         "--output_dir",
         str(output_dir / "scores"),
         "--reference_models",
@@ -277,14 +436,10 @@ def score_panel(
         str(ORDER_CONTRAST["min_sentence_tokens"]),
         "--order_contrast_max_sentence_tokens",
         str(ORDER_CONTRAST["max_sentence_tokens"]),
-        "--order_contrast_seed",
-        str(ORDER_CONTRAST["seed"]),
         "--order_contrast_distractor_source",
         "fineweb_controls",
         "--order_contrast_distractor_fineweb_count",
         str(ORDER_CONTRAST["distractor_fineweb_count"]),
-        "--order_contrast_distractor_seed",
-        str(ORDER_CONTRAST["distractor_seed"]),
         "--document_coherence",
         "--doc_coherence_min_sentences",
         str(DOCUMENT_COHERENCE["min_sentences"]),
@@ -306,8 +461,6 @@ def score_panel(
         str(DOCUMENT_COHERENCE["replacement_sentences"]),
         "--doc_coherence_block_sentences",
         str(DOCUMENT_COHERENCE["block_sentences"]),
-        "--doc_coherence_seed",
-        str(DOCUMENT_COHERENCE["seed"]),
     ]
     if allow_fineweb_fallback:
         command.append("--allow_fineweb_fallback")
@@ -321,9 +474,8 @@ def summarize_scores(
     rule: dict[str, Any],
     reference_model: str,
     require_significance: bool,
-    sample_seed: int | None,
-    temperature: float | None,
-    top_k: int | None,
+    temperature: float,
+    top_k: int,
 ) -> tuple[bool, list[dict[str, Any]]]:
     rows = [
         row
@@ -364,15 +516,9 @@ def summarize_scores(
         "# Quality Gate Result",
         "",
         f"- reference model: `{reference_model}`",
-        f"- sampling seed: `{sample_seed}`"
-        if sample_seed is not None
-        else "- sampling seed: `not applicable (precomputed panel)`",
-        f"- sampling temperature: `{temperature}`"
-        if temperature is not None
-        else "- sampling temperature: `not applicable (precomputed panel)`",
-        f"- sampling top_k: `{top_k}`"
-        if top_k is not None
-        else "- sampling top_k: `not applicable (precomputed panel)`",
+        f"- evaluation randomness: `checkpoint-derived ({SEED_PROTOCOL})`",
+        f"- sampling temperature: `{temperature}`",
+        f"- sampling top_k: `{top_k}`",
         f"- samples: `{total}`",
         f"- passing samples: `{passed}`",
         f"- pass rate: `{pass_rate:.4f}`",
@@ -404,8 +550,13 @@ def summarize_scores(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate unconditional samples from a checkpoint and apply the v0 quality gate.")
-    parser.add_argument("checkpoint", nargs="?", default="", help="Checkpoint to sample. Omit when using --panel_json.")
-    parser.add_argument("--panel_json", default="", help="Existing panel JSON to score instead of sampling a checkpoint.")
+    parser.add_argument("checkpoint", help="Checkpoint whose contents determine all evaluation randomness.")
+    parser.add_argument(
+        "--reuse_samples_from",
+        default="",
+        metavar="OUTPUT_DIR",
+        help="Reuse generated samples from a previous scorer output directory for this exact checkpoint.",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--rule_json", default=str(REPO_ROOT / "generation_quality_rule.json"))
     parser.add_argument("--reference_model", default="")
@@ -415,7 +566,6 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--dlm_sampler",
         default="auto",
@@ -425,12 +575,6 @@ def main() -> None:
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
     parser.add_argument("--num_sampling_steps", type=int, default=1000)
     parser.add_argument("--sampling_eps", type=float, default=1e-5)
-    parser.add_argument(
-        "--sampling_batch_size",
-        type=int,
-        default=1,
-        help="Number of unconditional DLM samples to generate per batch; AR checkpoints ignore this.",
-    )
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--max_eval_tokens", type=int, default=4096)
     parser.add_argument("--score_batch_size", type=int, default=4)
@@ -445,31 +589,63 @@ def main() -> None:
     total_start = time.perf_counter()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    rule = json.loads(Path(args.rule_json).read_text())
+    rule_path = Path(args.rule_json).resolve()
+    rule = json.loads(rule_path.read_text())
+    official_sampling_batch_size = int(rule["official_sampling_batch_size"])
+    if official_sampling_batch_size < 1:
+        raise ValueError("official_sampling_batch_size must be positive")
     reference_model = args.reference_model or rule["candidate_reference_model"]
     pinned_reference_model = args.pinned_reference_model or rule.get("pinned_reference_model", "")
 
-    panel_json = (
-        Path(args.panel_json).resolve()
-        if args.panel_json
-        else generate_panel(
+    checkpoint = Path(args.checkpoint).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    evaluation_seeds = checkpoint_evaluation_seeds(checkpoint_sha256)
+
+    if args.reuse_samples_from:
+        source_manifest = Path(args.reuse_samples_from).resolve() / "sample_manifest.json"
+        load_verified_sample_manifest(
+            source_manifest,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+        manifest_path = materialize_reused_samples(source_manifest, output_dir)
+        _, sample_payload = load_verified_sample_manifest(
+            manifest_path,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+    else:
+        manifest_path = generate_sample_manifest(
             args.checkpoint,
+            checkpoint_sha256,
+            evaluation_seeds,
             output_dir,
             args.tokens,
             args.samples,
             args.temperature,
             args.top_k,
-            args.seed,
             args.dlm_sampler,
             args.checkpoint_variant,
             args.amp_dtype,
             args.num_sampling_steps,
             args.sampling_eps,
-            args.sampling_batch_size,
+            official_sampling_batch_size,
         )
-    )
-    sample_scores = score_panel(
-        panel_json,
+        _, sample_payload = load_verified_sample_manifest(
+            manifest_path,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+
+    sample_rows = sample_payload["samples"]
+    temperatures = {float(row["temperature"]) for row in sample_rows}
+    top_ks = {int(row["top_k"]) for row in sample_rows}
+    if len(temperatures) != 1 or len(top_ks) != 1:
+        raise ValueError(f"Samples in {manifest_path} do not use one sampling configuration")
+    sample_scores = score_generated_samples(
+        manifest_path,
         output_dir,
         reference_model,
         pinned_reference_model,
@@ -486,9 +662,16 @@ def main() -> None:
         rule,
         reference_model,
         require_significance=args.require_significance,
-        sample_seed=None if args.panel_json else args.seed,
-        temperature=None if args.panel_json else args.temperature,
-        top_k=None if args.panel_json else args.top_k,
+        temperature=temperatures.pop(),
+        top_k=top_ks.pop(),
+    )
+    record_scoring_provenance(
+        manifest_path,
+        rule_path,
+        rule,
+        reference_model,
+        pinned_reference_model,
+        args,
     )
     timing("summarize_scores", time.perf_counter() - summarize_start)
     print(f"QUALITY_GATE_RESULT pass={str(passed).lower()} report={output_dir / 'README.md'}", flush=True)

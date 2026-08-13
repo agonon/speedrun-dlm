@@ -1,7 +1,7 @@
 """Internal scoring implementation for the generation-quality gate.
 
 The public entry point is python -m speedrun_dlm.score_generation_quality.
-This module scores an already-generated panel and writes per-sample metrics.
+This module scores generated sample sets and writes per-sample metrics.
 """
 
 import argparse
@@ -17,6 +17,8 @@ import zlib
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+from .score_generation_quality import SEED_PROTOCOL, checkpoint_evaluation_seeds
 
 
 TOKEN_RE = re.compile(r"\S+")
@@ -116,10 +118,10 @@ def stable_int(text: str) -> int:
     return int(digest[:16], 16)
 
 
-def load_panel(path: Path) -> dict[str, Any]:
+def load_sample_manifest(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text())
     if data.get("version") != 1:
-        raise ValueError(f"Unsupported panel version in {path}")
+        raise ValueError(f"Unsupported sample-manifest version in {path}")
     return data
 
 
@@ -131,7 +133,7 @@ def normalize_payload(payload: Any) -> list[dict[str, Any]]:
     raise ValueError("Sample JSON must be either a list or a dict with a 'samples' list.")
 
 
-def normalize_sample(panel: dict[str, Any], item: dict[str, Any], index: int) -> dict[str, str]:
+def normalize_sample(sample_set: dict[str, Any], item: dict[str, Any], index: int) -> dict[str, str]:
     prompt = str(item.get("prompt") or "")
     continuation = item.get("continuation")
     generated = item.get("generated_text")
@@ -153,7 +155,7 @@ def normalize_sample(panel: dict[str, Any], item: dict[str, Any], index: int) ->
         else:
             full_text = f"{prompt}{continuation}"
 
-    protocol = str(panel.get("protocol") or item.get("sample_mode") or item.get("mode") or "unknown")
+    protocol = str(sample_set.get("protocol") or item.get("sample_mode") or item.get("mode") or "unknown")
     if protocol == "unconditional":
         score_prompt = ""
         score_target = str(generated if generated is not None else full_text)
@@ -162,11 +164,11 @@ def normalize_sample(panel: dict[str, Any], item: dict[str, Any], index: int) ->
         score_target = str(continuation)
 
     return {
-        "panel": str(panel["name"]),
-        "family": str(panel.get("family", "")),
+        "sample_set": str(sample_set["name"]),
+        "family": str(sample_set.get("family", "")),
         "protocol": protocol,
-        "gate_label": str(panel.get("gate_label", "")),
-        "subjective_tier": "" if panel.get("subjective_tier") is None else str(panel["subjective_tier"]),
+        "gate_label": str(sample_set.get("gate_label", "")),
+        "subjective_tier": "" if sample_set.get("subjective_tier") is None else str(sample_set["subjective_tier"]),
         "sample_index_global": str(index),
         "prompt_index": str(item.get("prompt_index", "")),
         "sample_index": str(item.get("sample_index", "")),
@@ -178,7 +180,7 @@ def normalize_sample(panel: dict[str, Any], item: dict[str, Any], index: int) ->
 
 
 def make_sample(
-    panel: str,
+    sample_set: str,
     family: str,
     protocol: str,
     gate_label: str,
@@ -188,7 +190,7 @@ def make_sample(
     prompt: str = "",
 ) -> dict[str, str]:
     return {
-        "panel": panel,
+        "sample_set": sample_set,
         "family": family,
         "protocol": protocol,
         "gate_label": gate_label,
@@ -242,7 +244,7 @@ def load_fineweb_controls(
                 continue
             controls.append(
                 make_sample(
-                    panel="control_fineweb_real_text",
+                    sample_set="control_fineweb_real_text",
                     family="control_real_text",
                     protocol="real_text",
                     gate_label="reference_pass",
@@ -272,7 +274,7 @@ def load_fineweb_controls(
     ]
     return [
         make_sample(
-            panel="control_fallback_real_text",
+            sample_set="control_fallback_real_text",
             family="control_real_text",
             protocol="real_text",
             gate_label="reference_pass",
@@ -576,7 +578,7 @@ class ReferenceLMScorer:
         ]
         if not pair_indices:
             return empty_order_metrics(sentence_count=len(sentences))
-        rng = random.Random(seed + stable_int(f"{sample['panel']}::{sample['sample_index_global']}::{sample['seed']}"))
+        rng = random.Random(seed + stable_int(f"{sample['sample_set']}::{sample['sample_index_global']}::{sample['seed']}"))
         rng.shuffle(pair_indices)
         pair_indices = pair_indices[:pairs_per_sample]
 
@@ -731,7 +733,7 @@ class ReferenceLMScorer:
         if len(valid_sentences) < min_sentences:
             return empty_document_coherence_metrics(sentence_count=len(sentences))
 
-        rng = random.Random(seed + stable_int(f"{sample['panel']}::{sample['sample_index_global']}::{sample['seed']}"))
+        rng = random.Random(seed + stable_int(f"{sample['sample_set']}::{sample['sample_index_global']}::{sample['seed']}"))
         if len(valid_sentences) > max_sentences:
             # Use a deterministic contiguous window so corruptions preserve local topic and style.
             start = rng.randrange(0, len(valid_sentences) - max_sentences + 1)
@@ -918,19 +920,19 @@ def empty_document_coherence_metrics(sentence_count: int = 0) -> dict[str, float
     return out
 
 def iter_samples(
-    panel_json: Path,
-    limit_per_panel: int,
+    manifest_path: Path,
+    limit_per_sample_set: int,
 ) -> Iterable[dict[str, str]]:
-    data = load_panel(panel_json)
-    root = panel_json.parent
-    for panel in data["panels"]:
-        source = root / panel["sample_path"]
+    data = load_sample_manifest(manifest_path)
+    root = manifest_path.parent
+    for sample_set in data["sample_sets"]:
+        source = root / sample_set["sample_path"]
         payload = json.loads(source.read_text())
         items = normalize_payload(payload)
-        if limit_per_panel > 0:
-            items = items[:limit_per_panel]
+        if limit_per_sample_set > 0:
+            items = items[:limit_per_sample_set]
         for i, item in enumerate(items):
-            yield normalize_sample(panel, item, i)
+            yield normalize_sample(sample_set, item, i)
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -952,7 +954,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("panel_json")
+    parser.add_argument("sample_manifest_json")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--reference_models", default="")
     parser.add_argument("--pinned_reference_model", default="")
@@ -965,7 +967,7 @@ def main() -> None:
     parser.add_argument("--dtype", default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"])
     parser.add_argument("--max_eval_tokens", type=int, default=4096)
     parser.add_argument("--score_batch_size", type=int, default=4)
-    parser.add_argument("--limit_samples_per_panel", type=int, default=0)
+    parser.add_argument("--limit_samples_per_set", type=int, default=0)
     parser.add_argument("--no_trust_remote_code", action="store_true")
     parser.add_argument("--fineweb_dataset", default="HuggingFaceFW/fineweb")
     parser.add_argument("--fineweb_config", default="sample-10BT")
@@ -985,18 +987,16 @@ def main() -> None:
     parser.add_argument("--order_contrast_context_sentences", type=int, default=3)
     parser.add_argument("--order_contrast_min_sentence_tokens", type=int, default=5)
     parser.add_argument("--order_contrast_max_sentence_tokens", type=int, default=80)
-    parser.add_argument("--order_contrast_seed", type=int, default=1337)
     parser.add_argument(
         "--order_contrast_distractor_source",
-        choices=("panel", "fineweb_controls", "panel_plus_fineweb_controls"),
-        default="panel",
+        choices=("generated_samples", "fineweb_controls", "generated_samples_plus_fineweb_controls"),
+        default="generated_samples",
         help=(
             "Sentence source for external order-contrast distractors. "
-            "Use fineweb_controls for release/crossing runs so scores do not depend on which model panels are bundled together."
+            "Use fineweb_controls for release/crossing runs so scores do not depend on which generated samples are bundled together."
         ),
     )
     parser.add_argument("--order_contrast_distractor_fineweb_count", type=int, default=128)
-    parser.add_argument("--order_contrast_distractor_seed", type=int, default=-1)
     parser.add_argument(
         "--document_coherence",
         action="store_true",
@@ -1012,44 +1012,53 @@ def main() -> None:
     parser.add_argument("--doc_coherence_tail_splices", type=int, default=1)
     parser.add_argument("--doc_coherence_replacement_sentences", type=int, default=2)
     parser.add_argument("--doc_coherence_block_sentences", type=int, default=3)
-    parser.add_argument("--doc_coherence_seed", type=int, default=2027)
     args = parser.parse_args()
 
     total_start = time.perf_counter()
-    panel_json = Path(args.panel_json)
+    manifest_path = Path(args.sample_manifest_json)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest = load_sample_manifest(manifest_path)
+    evaluation = manifest.get("evaluation", {})
+    if evaluation.get("seed_protocol") != SEED_PROTOCOL:
+        raise ValueError(f"Sample manifest must use {SEED_PROTOCOL}")
+    fixed_seeds = evaluation.get("seeds")
+    checkpoint_sha256 = evaluation.get("checkpoint_sha256")
+    if not isinstance(checkpoint_sha256, str) or fixed_seeds != checkpoint_evaluation_seeds(checkpoint_sha256):
+        raise ValueError(f"Sample-manifest seeds were not derived from its checkpoint hash: {manifest_path}")
+    required_seed_names = {"order_contrast", "fineweb_controls", "document_coherence"}
+    if not isinstance(fixed_seeds, dict) or not required_seed_names <= fixed_seeds.keys():
+        raise ValueError(f"Sample manifest is missing checkpoint-derived evaluation seeds: {manifest_path}")
+    order_contrast_seed = int(fixed_seeds["order_contrast"])
+    fineweb_controls_seed = int(fixed_seeds["fineweb_controls"])
+    document_coherence_seed = int(fixed_seeds["document_coherence"])
+
     stage_start = time.perf_counter()
-    base_samples = list(iter_samples(panel_json, args.limit_samples_per_panel))
-    timing("load_panel_samples", time.perf_counter() - stage_start, samples=len(base_samples))
+    base_samples = list(iter_samples(manifest_path, args.limit_samples_per_set))
+    timing("load_generated_samples", time.perf_counter() - stage_start, samples=len(base_samples))
     sentence_cache: list[list[str]] = []
     candidate_pool: list[tuple[int, str]] = []
     candidate_docs: list[tuple[int, list[str]]] = []
     if args.order_contrast or args.document_coherence:
         stage_start = time.perf_counter()
-        use_panel_distractors = args.order_contrast_distractor_source in {
-            "panel",
-            "panel_plus_fineweb_controls",
+        use_generated_distractors = args.order_contrast_distractor_source in {
+            "generated_samples",
+            "generated_samples_plus_fineweb_controls",
         }
         for sample_index, sample in enumerate(base_samples):
             sentences = split_sentences(sample["target_text"])
             sentence_cache.append(sentences)
-            if use_panel_distractors:
+            if use_generated_distractors:
                 candidate_docs.append((sample_index, sentences))
-            if use_panel_distractors:
+            if use_generated_distractors:
                 for sentence in sentences:
                     candidate_pool.append((sample_index, sentence))
-        if args.order_contrast_distractor_source in {"fineweb_controls", "panel_plus_fineweb_controls"}:
-            distractor_seed = (
-                1337
-                if args.order_contrast_distractor_seed < 0
-                else args.order_contrast_distractor_seed
-            )
+        if args.order_contrast_distractor_source in {"fineweb_controls", "generated_samples_plus_fineweb_controls"}:
             control_start = time.perf_counter()
             distractor_samples = load_fineweb_controls(
                 count=args.order_contrast_distractor_fineweb_count,
-                seed=distractor_seed,
+                seed=fineweb_controls_seed,
                 dataset_name=args.fineweb_dataset,
                 dataset_config=args.fineweb_config,
                 pinned_fineweb=args.pinned_fineweb,
@@ -1136,7 +1145,7 @@ def main() -> None:
                         context_sentences=args.order_contrast_context_sentences,
                         min_sentence_tokens=args.order_contrast_min_sentence_tokens,
                         max_sentence_tokens=args.order_contrast_max_sentence_tokens,
-                        seed=args.order_contrast_seed,
+                        seed=order_contrast_seed,
                     )
                 )
                 order_seconds += time.perf_counter() - section_start
@@ -1158,7 +1167,7 @@ def main() -> None:
                         tail_splices=args.doc_coherence_tail_splices,
                         replacement_sentences=args.doc_coherence_replacement_sentences,
                         block_sentences=args.doc_coherence_block_sentences,
-                        seed=args.doc_coherence_seed,
+                        seed=document_coherence_seed,
                     )
                 )
                 doc_seconds += time.perf_counter() - section_start

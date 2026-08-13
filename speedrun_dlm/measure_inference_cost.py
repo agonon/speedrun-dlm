@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from .checkpoint_utils import load_snapshot, resolve_amp_dtype
+from .score_generation_quality import SEED_PROTOCOL, derive_evaluation_seed, sha256_file
 from .sample_text import (
     DLM_SAMPLER_CHOICES,
     checkpoint_objective_and_noise,
@@ -23,8 +24,6 @@ ATTENTION_FLOP_EVENT_MARKERS = (
     "aten::bmm",
     "aten::baddbmm",
 )
-
-
 def checkpoint_label(path: str) -> str:
     return Path(path).name or path
 
@@ -189,6 +188,8 @@ def write_markdown(payload: dict[str, Any], path: Path) -> None:
         f"- generated tokens per sample: `{payload['tokens_per_sample']}`",
         f"- measured samples: `{payload['measured_samples']}`",
         f"- warmup samples: `{payload['warmup_samples']}`",
+        f"- RNG seed protocol: `{payload['seed_protocol']}`",
+        f"- RNG seed: `{payload['seed']}`",
         f"- temperature: `{payload['temperature']}`",
         f"- top_k: `{payload['top_k']}`",
         f"- DLM sampler: `{payload['dlm_sampler']}`",
@@ -226,7 +227,6 @@ def main() -> None:
     parser.add_argument("--warmup_samples", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
@@ -237,6 +237,11 @@ def main() -> None:
     parser.add_argument("--output_md", default="")
     args = parser.parse_args()
 
+    checkpoint = Path(args.snapshot_path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    evaluation_seed = derive_evaluation_seed(checkpoint_sha256, "inference_cost")
     device = args.device
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
     snapshot = load_snapshot(args.snapshot_path, device=device, checkpoint_variant=args.checkpoint_variant)
@@ -260,7 +265,7 @@ def main() -> None:
             top_k=args.top_k,
             device=device,
             amp_dtype=amp_dtype,
-            seed=args.seed - args.warmup_samples + offset,
+            seed=evaluation_seed - args.warmup_samples + offset,
             dlm_sampler=args.dlm_sampler,
             num_sampling_steps=args.num_sampling_steps,
             sampling_eps=args.sampling_eps,
@@ -271,7 +276,7 @@ def main() -> None:
         snapshot,
         tokens=args.tokens,
         measured_samples=args.measured_samples,
-        seed=args.seed,
+        seed=evaluation_seed,
         temperature=args.temperature,
         top_k=args.top_k,
         device=device,
@@ -292,6 +297,10 @@ def main() -> None:
     total_flops_per_sample = per_sample_flops + attention_flops_added_by_formula_per_sample
     payload: dict[str, Any] = {
         "snapshot": checkpoint_label(args.snapshot_path),
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "seed_protocol": SEED_PROTOCOL,
+        "training_seed": snapshot.args.get("seed"),
         "trainer": snapshot.trainer,
         "checkpoint_variant": snapshot.checkpoint_variant,
         "num_parameters": int(num_parameters),
@@ -301,7 +310,7 @@ def main() -> None:
         "tokens_per_sample": args.tokens,
         "measured_samples": args.measured_samples,
         "warmup_samples": args.warmup_samples,
-        "seed": args.seed,
+        "seed": evaluation_seed,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "dlm_sampler": reported_dlm_sampler,

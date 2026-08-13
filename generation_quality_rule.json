@@ -1,5 +1,8 @@
 {
-  "version": "v0-strict-doccoh",
+  "version": "v0-strict-doccoh-checkpoint-seeds-b16",
+  "official_training_seed_start": 1,
+  "official_training_seed_end": 50,
+  "official_sampling_batch_size": 16,
   "candidate_reference_model": "Qwen/Qwen2.5-7B",
   "pinned_reference_model": "d149729398750b98c0af14eb82c78cfe92750796",
   "deterministic_preset": "medium",

@@ -7,7 +7,7 @@ The script copies machine-readable outputs into stable filenames:
 - gate_passes.tsv: one quality-gate summary row per seed.
 - auxiliary_metrics.json: inference-cost profiler output plus diversity metrics.
 - commands.jsonl: command templates used to train, gate, and profile the entry.
-- environment.json: optional runtime metadata for the machine/software stack.
+- environment.json: training-time hardware and software version snapshot.
 - recipe_snapshot.txt: source files that define the trainer, sampler, and gate.
 """
 
@@ -19,23 +19,45 @@ import json
 import math
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Support the documented `python3 records/make_record.py` invocation.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from speedrun_dlm.score_generation_quality import (  # noqa: E402
+    SEED_PROTOCOL,
+    derive_evaluation_seed,
+    load_verified_sample_manifest,
+    sample_pass,
+    sha256_file,
+)
+
 AR_REFERENCE_TFLOPS = 95.863037506048
 AR_REFERENCE_TOTAL_PARAMETERS = 124_318_464
 DEFAULT_SOURCE_FILES = [
+    "Dockerfile",
+    "constraints.txt",
+    "requirements.txt",
     "generation_quality_rule.json",
+    "prepare_data.sh",
+    "data/cached_fineweb10B.py",
     "run_ar.sh",
     "run_dlm.sh",
+    "records/capture_environment.py",
     "speedrun_dlm/train_ar.py",
     "speedrun_dlm/train_dlm.py",
+    "speedrun_dlm/checkpoint_utils.py",
     "speedrun_dlm/sample_text.py",
+    "speedrun_dlm/_quality_metrics.py",
     "speedrun_dlm/score_generation_quality.py",
     "speedrun_dlm/measure_inference_cost.py",
 ]
+
 
 RECORDS_CSV_FIELDS = [
     "record_id",
@@ -101,18 +123,88 @@ def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def parse_gate_dir(spec: str, rule: dict[str, Any], require_significance: bool) -> dict[str, Any]:
-    if "=" not in spec:
-        raise ValueError("--gate-dir must have the form SEED=path/to/gate_dir")
-    seed, raw_path = spec.split("=", 1)
+def official_training_seeds(rule: dict[str, Any]) -> tuple[int, ...]:
+    start = int(rule["official_training_seed_start"])
+    end = int(rule["official_training_seed_end"])
+    if start > end:
+        raise ValueError("official training seed range is empty")
+    return tuple(range(start, end + 1))
+
+
+def parse_gate_dir(raw_path: str, rule: dict[str, Any], require_significance: bool) -> dict[str, Any]:
     gate_dir = Path(raw_path)
+    manifest_path = gate_dir / "sample_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"missing sample manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    evaluation = manifest.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError(f"missing evaluation metadata in {manifest_path}")
+    checkpoint = Path(str(evaluation.get("checkpoint_path", "")))
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"checkpoint recorded by {manifest_path} is unavailable: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    manifest, sample_payload = load_verified_sample_manifest(
+        manifest_path,
+        checkpoint_sha256,
+        int(rule["official_sampling_batch_size"]),
+    )
+    evaluation = manifest["evaluation"]
+    seed = int(evaluation["training_seed"])
+    expected_seeds = evaluation["seeds"]
+
+    expected_scoring = {
+        "rule_version": rule["version"],
+        "rule_sha256": sha256_file(ROOT / "generation_quality_rule.json"),
+        "reference_model": rule["candidate_reference_model"],
+        "pinned_reference_model": rule["pinned_reference_model"],
+        "dtype": "bfloat16",
+        "max_eval_tokens": 4096,
+        "score_batch_size": 4,
+        "reference_device_map": "",
+        "allow_fineweb_fallback": False,
+        "significance_required": True,
+    }
+    scoring = manifest.get("scoring")
+    if not isinstance(scoring, dict):
+        raise ValueError(f"missing scoring provenance in {manifest_path}")
+    for key, expected in expected_scoring.items():
+        if scoring.get(key) != expected:
+            raise ValueError(f"official scorer setting {key!r} is invalid in {manifest_path}")
+
     sample_passes = gate_dir / "sample_passes.csv"
     if not sample_passes.exists():
         raise FileNotFoundError(f"missing {sample_passes}")
+    sample_scores = gate_dir / "scores" / "sample_scores.csv"
+    if not sample_scores.exists():
+        raise FileNotFoundError(f"missing {sample_scores}")
+    if scoring.get("sample_scores_sha256") != sha256_file(sample_scores):
+        raise ValueError(f"sample-score hash does not match {manifest_path}")
+    if scoring.get("sample_passes_sha256") != sha256_file(sample_passes):
+        raise ValueError(f"sample-pass hash does not match {manifest_path}")
+    sample_rows = sample_payload.get("samples")
+    if len(sample_rows) != 128:
+        raise ValueError("official quality gates must contain exactly 128 generated samples")
+
     with sample_passes.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
+    with sample_scores.open(newline="") as handle:
+        score_rows = [
+            row
+            for row in csv.DictReader(handle)
+            if row.get("reference_model") == rule["candidate_reference_model"]
+            and row.get("protocol") == "unconditional"
+        ]
     samples = len(rows)
-    passing = sum(truthy(row.get("pass", 0)) for row in rows)
+    if samples != len(sample_rows) or len(score_rows) != samples:
+        raise ValueError(f"sample-pass count does not match generated sample count in {gate_dir}")
+    for index, (row, score_row) in enumerate(zip(rows, score_rows, strict=True)):
+        score_sample_id = score_row.get("sample_id", score_row.get("sample_index", ""))
+        if row.get("sample_id") != score_sample_id:
+            raise ValueError(f"sample {index} is misaligned between scores and passes in {gate_dir}")
+        if truthy(row.get("pass", 0)) != sample_pass(score_row, rule):
+            raise ValueError(f"sample {index} pass was not produced by the official rule in {gate_dir}")
+    passing = sum(sample_pass(row, rule) for row in score_rows)
     pass_rate = passing / samples if samples else 0.0
     threshold = float(rule["pass_rate_threshold"])
     p_value = binom_tail_ge(samples, passing, threshold)
@@ -121,7 +213,9 @@ def parse_gate_dir(spec: str, rule: dict[str, Any], require_significance: bool) 
     )
     return {
         "seed": seed,
-        "sampling_seed": seed,
+        "sampling_seed": expected_seeds["sampling"],
+        "checkpoint_sha256": checkpoint_sha256,
+        "seed_protocol": SEED_PROTOCOL,
         "samples": samples,
         "passing_samples": passing,
         "pass_rate": f"{pass_rate:.4f}",
@@ -177,6 +271,7 @@ def sanitize_train_result(record_name: str, row: dict[str, Any]) -> dict[str, An
 
 def sanitize_inference_cost(record_name: str, row: dict[str, Any], profiled_train_seed: int | None) -> dict[str, Any]:
     row = dict(row)
+    row.pop("checkpoint_path", None)
     if isinstance(row.get("snapshot"), str):
         row["snapshot"] = checkpoint_uri(record_name, profiled_train_seed, row["snapshot"])
     return row
@@ -225,9 +320,11 @@ def write_commands(output: Path, commands: list[str]) -> None:
 
 def copy_environment_json(output: Path, environment_json: Path | None) -> None:
     if environment_json is None:
-        return
-    # Validate that the submitted file is readable JSON before publishing it as a record artifact.
-    json.loads(environment_json.read_text())
+        raise ValueError("a training-time environment snapshot is required")
+    # Validate the training-time snapshot before publishing it as a record artifact.
+    environment = json.loads(environment_json.read_text())
+    if not isinstance(environment, dict):
+        raise ValueError(f"{environment_json} must contain a JSON object")
     destination = output / "environment.json"
     if environment_json.resolve() != destination.resolve():
         shutil.copyfile(environment_json, destination)
@@ -240,7 +337,25 @@ def write_auxiliary_metrics(
     diversity_unigram_entropy_bits: float | None,
     diversity_distinct_2: float | None,
 ) -> dict[str, Any]:
-    inference = sanitize_inference_cost(output.name, json.loads(inference_cost_json.read_text()), profiled_train_seed)
+    raw_inference = json.loads(inference_cost_json.read_text())
+    if raw_inference.get("seed_protocol") != SEED_PROTOCOL:
+        raise ValueError(f"{inference_cost_json} does not use {SEED_PROTOCOL}")
+    checkpoint = Path(str(raw_inference.get("checkpoint_path", "")))
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"profiled checkpoint is unavailable: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    if checkpoint_sha256 != raw_inference.get("checkpoint_sha256"):
+        raise ValueError(f"profiled checkpoint hash does not match {inference_cost_json}")
+    expected_seed = derive_evaluation_seed(checkpoint_sha256, "inference_cost")
+    reported_seed = raw_inference.get("seed")
+    if type(reported_seed) is not int or reported_seed != expected_seed:
+        raise ValueError(
+            f"{inference_cost_json} reports inference-cost seed {reported_seed!r}; "
+            f"the official checkpoint-derived seed is {expected_seed}"
+        )
+    if profiled_train_seed is None or int(raw_inference.get("training_seed")) != profiled_train_seed:
+        raise ValueError("--profiled-train-seed must match the training seed stored in the profiled checkpoint")
+    inference = sanitize_inference_cost(output.name, raw_inference, profiled_train_seed)
     auxiliary = {
         "inference_cost": inference,
         "diversity": {
@@ -268,6 +383,7 @@ def append_records_csv(path: Path, row: dict[str, Any]) -> None:
 def validate_record_rows(
     training_rows: list[dict[str, Any]],
     gate_rows: list[dict[str, str]],
+    rule: dict[str, Any],
     min_passes: int | None,
 ) -> None:
     if not training_rows:
@@ -279,6 +395,14 @@ def validate_record_rows(
             f"expected one gate row per training seed, got {len(training_rows)} training rows "
             f"and {len(gate_rows)} gate rows"
         )
+    expected_seeds = list(official_training_seeds(rule))
+    seed_range = f"{expected_seeds[0]} through {expected_seeds[-1]}"
+    train_seed_list = sorted(int(row["seed"]) for row in training_rows)
+    gate_seed_list = sorted(int(row["seed"]) for row in gate_rows)
+    if train_seed_list != expected_seeds:
+        raise SystemExit(f"official records must contain every training seed from {seed_range} exactly once")
+    if gate_seed_list != expected_seeds:
+        raise SystemExit(f"official records must contain one verified gate output for every seed from {seed_range}")
     train_seeds = {str(row.get("seed")) for row in training_rows if row.get("seed") is not None}
     gate_seeds = {str(row.get("seed")) for row in gate_rows if row.get("seed")}
     if train_seeds and gate_seeds and train_seeds != gate_seeds:
@@ -288,6 +412,9 @@ def validate_record_rows(
         )
     passes = 0
     for row in gate_rows:
+        if row.get("seed_protocol") != SEED_PROTOCOL or not row.get("checkpoint_sha256"):
+            seed = row.get("seed", "<unknown>")
+            raise SystemExit(f"seed {seed} does not have verified checkpoint-derived evaluation seeds")
         if not truthy(row.get("significance_required", "")):
             seed = row.get("seed", "<unknown>")
             raise SystemExit(f"seed {seed} was not checked with the required significance rule")
@@ -391,37 +518,46 @@ def main() -> None:
     parser.add_argument("--training-runs-jsonl", type=Path)
     parser.add_argument("--train-result-json", action="append", default=[])
     parser.add_argument("--train-log", action="append", default=[], help="Repeat with logs containing TRAIN_RESULT lines.")
-    parser.add_argument("--gate-passes-tsv", type=Path)
-    parser.add_argument("--gate-dir", action="append", default=[], help="Repeat as SEED=path/to/gate_dir.")
+    parser.add_argument(
+        "--gate-dir",
+        action="append",
+        default=[],
+        help="Repeat with each scorer output directory; its training seed is read from sample_manifest.json.",
+    )
     parser.add_argument("--inference-cost-json", type=Path, required=True)
-    parser.add_argument("--profiled-train-seed", type=int, help="Training seed of the checkpoint used for profiling.")
+    parser.add_argument(
+        "--profiled-train-seed",
+        type=int,
+        required=True,
+        help="Training seed of the checkpoint used for inference-cost profiling.",
+    )
     parser.add_argument("--diversity-unigram-entropy-bits", type=float)
     parser.add_argument("--diversity-distinct-2", type=float)
     parser.add_argument("--source-file", action="append", default=[])
     parser.add_argument("--snapshot-note", default="Source files defining the trainer, sampler, and gate.")
-    parser.add_argument("--environment-json", type=Path, help="Optional environment snapshot to copy as environment.json.")
+    parser.add_argument(
+        "--environment-json",
+        type=Path,
+        required=True,
+        help="Training-time hardware and software version snapshot to copy into the record.",
+    )
     parser.add_argument("--command", action="append", default=[], help="Repeat as KIND=command to write commands.jsonl.")
     parser.add_argument("--records-csv", type=Path, help="Append one row to this leaderboard CSV.")
     args = parser.parse_args()
 
     if not args.training_runs_jsonl and not args.train_result_json and not args.train_log:
         raise SystemExit("Provide --training-runs-jsonl, --train-result-json, or --train-log.")
-    if not args.gate_passes_tsv and not args.gate_dir:
-        raise SystemExit("Provide --gate-passes-tsv or at least one --gate-dir.")
+    if not args.gate_dir:
+        raise SystemExit("Provide one --gate-dir for each official training seed.")
 
     record_dir = Path(args.record_dir)
     record_dir.mkdir(parents=True, exist_ok=True)
     training_rows = copy_training_runs(record_dir, args.training_runs_jsonl, args.train_result_json, args.train_log)
 
-    if args.gate_passes_tsv:
-        destination = record_dir / "gate_passes.tsv"
-        if args.gate_passes_tsv.resolve() != destination.resolve():
-            shutil.copyfile(args.gate_passes_tsv, destination)
-    else:
-        rule = json.loads((ROOT / "generation_quality_rule.json").read_text())
-        write_tsv(record_dir / "gate_passes.tsv", [parse_gate_dir(spec, rule, True) for spec in args.gate_dir])
+    rule = json.loads((ROOT / "generation_quality_rule.json").read_text())
+    write_tsv(record_dir / "gate_passes.tsv", [parse_gate_dir(spec, rule, True) for spec in args.gate_dir])
     gate_rows = read_tsv(record_dir / "gate_passes.tsv")
-    validate_record_rows(training_rows, gate_rows, args.min_passes)
+    validate_record_rows(training_rows, gate_rows, rule, args.min_passes)
 
     auxiliary = write_auxiliary_metrics(
         record_dir,

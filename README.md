@@ -57,6 +57,8 @@ Inference TFLOPs are FLOPs counted by PyTorch while sampling, plus the attention
 - Same *scorer*: pinned `Qwen/Qwen2.5-7B`.
 - Same *hardware*: 8 H100 80GB GPUs.
 - Same *quality gate*: 128 unconditional samples of 1024 tokens.
+- Same 50 *training seeds*: every official entry must run each integer seed from `1` through `50`.
+- Checkpoint-derived *evaluation randomness*: separate seeds for sampling, inference-cost profiling, and randomized quality checks are automatically derived from a hash of the checkpoint to evaluate. This avoids cherry-picking evaluation seeds and follows a helpful suggestion by [@JCBrouwer in issue #1](https://github.com/agonon/speedrun-dlm/issues/1). Text is sampled with a fixed batch size of 16, ensuring that a given checkpoint and seed always produce the same samples.
 - A seed passes if at least 108 out of 128 samples pass.
 - A DLM sampler must cost less than 95.86 TFLOPs for one 1024-token sample.
 - Runs are ranked by mean training time over 50 seeds.
@@ -109,26 +111,27 @@ To get your method on the leaderboard, **open a pull request** with:
 If you use the current trainer, sampler, and scorer outputs, you can create the record folder with [`records/make_record.py`](records/make_record.py):
 
 ```bash
-python records/capture_environment.py > results/my_method/environment.json
+gate_args=()
+for seed in $(seq 1 50); do
+  gate_args+=(--gate-dir "results/my_method/gate_seed_${seed}")
+done
 
-python records/make_record.py \
+python3 records/make_record.py \
   --record-dir records/nextfreeid-my-method \
   --record-id nextfreeid \
   --entry my_method \
   --trainer dlm \
   --sampler S=mysamplingsteps \
   --training-runs-jsonl results/my_method/training_runs.jsonl \
-  --gate-passes-tsv results/my_method/gate_passes.tsv \
+  "${gate_args[@]}" \
   --inference-cost-json results/my_method/inference_cost.json \
-  --environment-json results/my_method/environment.json \
+  --profiled-train-seed 1 \
+  --environment-json results/my_method/train_seed_1/environment.json \
   --min-passes 42 \
   --records-csv records/records.csv
 ```
 
-Each submitted entry should include 50 seeds, report how many seeds pass the
-gate, keep an `environment.json` snapshot, and stay below 95.86 TFLOPs for one
-1024-token sample. We will check the timing and record artifacts on our cluster
-for each PR.
+Each submitted record must satisfy the [rules](#rules) above. We will check the timing and record artifacts on our cluster for each PR.
 
 ## Run
 
@@ -147,7 +150,7 @@ bash run_dlm.sh
 ## Check a candidate
 
 ```bash
-python -m speedrun_dlm.score_generation_quality path/to/checkpoint.pt \
+python3 -m speedrun_dlm.score_generation_quality path/to/checkpoint.pt \
   --samples 128 \
   --tokens 1024 \
   --top_k 0 \
@@ -158,7 +161,7 @@ python -m speedrun_dlm.score_generation_quality path/to/checkpoint.pt \
 ```
 
 ```bash
-python -m speedrun_dlm.measure_inference_cost path/to/checkpoint.pt \
+python3 -m speedrun_dlm.measure_inference_cost path/to/checkpoint.pt \
   --tokens 1024 \
   --top_k 0 \
   --num_sampling_steps 344 \

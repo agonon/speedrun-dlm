@@ -1293,7 +1293,7 @@ def main() -> None:
     parser.add_argument("--samples_per_prompt", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
@@ -1333,10 +1333,10 @@ def main() -> None:
     sample_index = 0
     while sample_index < args.samples_per_prompt:
         chunk_start = time.perf_counter()
+        batch_seed = args.seed + sample_index
         if snapshot.trainer == "ar":
             chunk_size = 1
-            local_seed = args.seed + sample_index
-            generator.manual_seed(local_seed)
+            generator.manual_seed(batch_seed)
             tokens = sample_ar(
                 snapshot.model,
                 [getattr(tokenizer, "eot_token", 50256)],
@@ -1350,7 +1350,7 @@ def main() -> None:
             token_batches = [tokens]
         elif snapshot.trainer == "dlm":
             chunk_size = min(max(1, args.sampling_batch_size), args.samples_per_prompt - sample_index)
-            generator.manual_seed(args.seed + sample_index)
+            generator.manual_seed(batch_seed)
             token_batches = sample_dlm(
                 snapshot.model,
                 snapshot.args,
@@ -1370,13 +1370,12 @@ def main() -> None:
 
         for offset, tokens in enumerate(token_batches):
             current_index = sample_index + offset
-            local_seed = args.seed + current_index
             text = tokenizer.decode(tokens)
             rows.append(
                 {
                     "prompt_index": 0,
                     "sample_index": current_index,
-                    "seed": local_seed,
+                    "seed": batch_seed,
                     "trainer": snapshot.trainer,
                     "protocol": "unconditional",
                     "sample_mode": "unconditional",
@@ -1411,6 +1410,7 @@ def main() -> None:
     payload = {
         "snapshot": checkpoint_label(args.snapshot_path),
         "trainer": snapshot.trainer,
+        "training_seed": snapshot.args.get("seed"),
         "checkpoint_variant": snapshot.checkpoint_variant,
         "sample_mode": "unconditional",
         "samples": rows,
