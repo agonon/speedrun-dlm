@@ -20,7 +20,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_a
   --num_checkpoints "${NUM_CHECKPOINTS:-1}" \
   --learning_rate "${LEARNING_RATE:-3e-4}" \
   --warmup_iters "${WARMUP_ITERS:-320}" \
-  --seed "${SEED:-1337}" \
+  --seed "${SEED:-1}" \
   --val_loss_every "${VAL_LOSS_EVERY:-500}" \
   --val_max_steps "${VAL_MAX_STEPS:-8}" \
   --output_dir "$OUTPUT_DIR" \

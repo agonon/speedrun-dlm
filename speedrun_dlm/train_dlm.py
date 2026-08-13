@@ -1333,7 +1333,7 @@ def main():
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_eps", type=float, default=1e-8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--val_loss_every", type=int, default=0)
     parser.add_argument("--val_max_steps", type=int, default=20)
     parser.add_argument("--num_checkpoints", type=int, default=1)

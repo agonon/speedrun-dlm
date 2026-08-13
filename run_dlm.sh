@@ -60,7 +60,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_d
   --cond_dim "${DLM_COND_DIM:-128}" \
   --dropout "${DLM_DROPOUT:-0.1}" \
   --warmup_iters "${WARMUP_ITERS:-384}" \
-  --seed "${SEED:-1337}" \
+  --seed "${SEED:-1}" \
   --val_loss_every "${VAL_LOSS_EVERY:-5040}" \
   --val_max_steps "${VAL_MAX_STEPS:-8}" \
   --output_dir "$OUTPUT_DIR" \

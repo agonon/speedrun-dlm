@@ -232,7 +232,7 @@ def main():
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--val_loss_every", type=int, default=0)
     parser.add_argument("--val_max_steps", type=int, default=20)
     parser.add_argument(
