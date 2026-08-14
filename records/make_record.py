@@ -398,6 +398,21 @@ def validate_record_rows(
         )
     if not experimental and train_seed_list != expected_seeds:
         raise SystemExit(f"official records must contain every training seed from {seed_range} exactly once")
+    if not experimental:
+        for field in ("num_iterations", "total_tokens_processed"):
+            values_by_seed = {}
+            for row in training_rows:
+                value = row.get(field)
+                if type(value) is not int or value <= 0:
+                    raise SystemExit(
+                        f"official training row for seed {row.get('seed', '<unknown>')} "
+                        f"must contain a positive integer {field}"
+                    )
+                values_by_seed[int(row["seed"])] = value
+            if len(set(values_by_seed.values())) != 1:
+                raise SystemExit(
+                    f"official training runs must use one common {field}; got {values_by_seed}"
+                )
     for row in gate_rows:
         if row.get("seed_protocol") != SEED_PROTOCOL or not row.get("checkpoint_sha256"):
             seed = row.get("seed", "<unknown>")
