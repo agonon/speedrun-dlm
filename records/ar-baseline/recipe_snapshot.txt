@@ -1,14 +1,155 @@
 # Recipe snapshot
 
-Source files defining the trainer, sampler, and gate.
+Source files defining the trainer, sampler, and quality gate.
+
+===== Dockerfile =====
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04@sha256:24c8e3581ea6330038b0d374920721983312627f8adbfcf390bdb4b399d280ed
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONUNBUFFERED=1
+
+# Fetch Ubuntu packages from Canonical's public APT snapshot dated
+# 2026-08-12 12:00 UTC so the installed system packages are reproducible.
+RUN sed -i -E \
+      's#^URIs: http://(archive\.ubuntu\.com/ubuntu|security\.ubuntu\.com/ubuntu|ports\.ubuntu\.com/ubuntu-ports)/?$#URIs: https://snapshot.ubuntu.com/ubuntu/20260812T120000Z/#' \
+      /etc/apt/sources.list.d/ubuntu.sources && \
+    rm -f /etc/apt/sources.list.d/cuda.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt constraints.txt /speedrun-dlm/
+WORKDIR /speedrun-dlm
+
+ARG TORCH_VERSION=2.10.0+cu128
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG PIP_VERSION=26.2.1
+
+RUN python3 -m pip install --ignore-installed --break-system-packages "pip==$PIP_VERSION" && \
+    python3 -m pip install --break-system-packages \
+      --index-url "$TORCH_INDEX_URL" \
+      --constraint constraints.txt \
+      "torch==$TORCH_VERSION" && \
+    grep -v '^torch' requirements.txt > /tmp/requirements-no-torch.txt && \
+    python3 -m pip install --break-system-packages \
+      --constraint constraints.txt \
+      --requirement /tmp/requirements-no-torch.txt
+
+COPY . /speedrun-dlm
+
+CMD ["bash"]
+ENTRYPOINT []
+
+
+===== constraints.txt =====
+# Resolved identically on linux/amd64 and linux/arm64 from requirements.txt.
+# PyTorch and pip are pinned separately in Dockerfile.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+anyio==4.14.2
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.4.9
+click==8.4.2
+cuda-bindings==12.9.4
+cuda-pathfinder==1.2.2
+datasets==5.0.1
+dill==0.4.1
+filelock==3.29.0
+frozenlist==1.8.0
+fsspec==2026.4.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface-hub==1.27.0
+idna==3.18
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+multidict==6.7.1
+multiprocess==0.70.19
+networkx==3.6.1
+numpy==2.5.2
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cuda-cupti-cu12==12.8.90
+nvidia-cuda-nvrtc-cu12==12.8.93
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cufft-cu12==11.3.3.83
+nvidia-cufile-cu12==1.13.1.3
+nvidia-curand-cu12==10.3.9.90
+nvidia-cusolver-cu12==11.7.3.90
+nvidia-cusparse-cu12==12.5.8.93
+nvidia-cusparselt-cu12==0.7.1
+nvidia-nccl-cu12==2.27.5
+nvidia-nvjitlink-cu12==12.8.93
+nvidia-nvshmem-cu12==3.4.5
+nvidia-nvtx-cu12==12.8.90
+packaging==26.3
+pandas==3.0.5
+propcache==0.5.2
+pyarrow==25.0.1
+Pygments==2.20.0
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+regex==2026.7.19
+requests==2.34.2
+rich==15.0.0
+safetensors==0.8.0
+setuptools==68.1.2
+shellingham==1.5.4
+six==1.17.0
+sympy==1.14.0
+tiktoken==0.13.0
+tokenizers==0.22.2
+tqdm==4.70.0
+transformers==5.15.0
+triton==3.6.0
+typer==0.27.1
+typing_extensions==4.15.0
+urllib3==2.7.0
+wheel==0.42.0
+xxhash==3.8.1
+yarl==1.24.5
+
+
+===== requirements.txt =====
+numpy==2.5.2
+tqdm==4.70.0
+torch==2.10.0
+huggingface-hub==1.27.0
+transformers==5.15.0
+safetensors==0.8.0
+datasets==5.0.1
+tiktoken==0.13.0
+
 
 ===== generation_quality_rule.json =====
 {
-  "version": "v0-strict-doccoh",
+  "version": "v0-strict-doccoh-checkpoint-seeds-b16-pooled",
+  "official_training_seed_start": 1,
+  "official_training_seed_end": 50,
+  "official_samples_per_training_seed": 128,
+  "official_min_passing_samples": 4881,
+  "official_sampling_batch_size": 16,
   "candidate_reference_model": "Qwen/Qwen2.5-7B",
+  "pinned_reference_model": "d149729398750b98c0af14eb82c78cfe92750796",
   "deterministic_preset": "medium",
   "bpb_threshold": 2.1,
-  "pass_rate_threshold": 0.75,
   "max_bad_char_count": 0.0,
   "order_protocols": [
     "unconditional"
@@ -23,17 +164,55 @@ Source files defining the trainer, sampler, and gate.
   "doc_coherence_min_corruptions": 5.0,
   "doc_coherence_win_rate_threshold": null,
   "doc_coherence_margin_threshold": -0.2,
-  "doc_coherence_kind_margin_thresholds": {},
-  "significance_p_value": 0.01
+  "doc_coherence_kind_margin_thresholds": {}
 }
+
+
+===== prepare_data.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_TOKENS=${1:-393216000}
+CHUNK_TOKENS=100000000
+TRAIN_CHUNKS=$(( (TARGET_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
+
+python3 data/cached_fineweb10B.py "$TRAIN_CHUNKS"
+
+
+===== data/cached_fineweb10B.py =====
+import os
+import sys
+from huggingface_hub import hf_hub_download
+# Download the GPT-2 tokens of Fineweb10B from huggingface. This
+# saves about an hour of startup time compared to regenerating them.
+PINNED_FINEWEB10B_GPT2_COMMIT = "889765ea1f903759787add96995d81171b632d0c"
+def get(fname):
+    local_dir = os.path.join(os.path.dirname(__file__), 'fineweb10B')
+    if not os.path.exists(os.path.join(local_dir, fname)):
+        hf_hub_download(repo_id="kjj0/fineweb10B-gpt2", filename=fname,
+                        repo_type="dataset", local_dir=local_dir,
+                        revision=PINNED_FINEWEB10B_GPT2_COMMIT)
+get("fineweb_val_%06d.bin" % 0)
+num_chunks = 103 # full fineweb10B. Each chunk is 100M tokens
+if len(sys.argv) >= 2: # we can pass an argument to download less
+    num_chunks = int(sys.argv[1])
+for i in range(1, num_chunks+1):
+    get("fineweb_train_%06d.bin" % i)
 
 
 ===== run_ar.sh =====
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep mounted home directories from overriding the versions installed in the
+# official container image.
+export PYTHONNOUSERSITE=1
+
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 OUTPUT_DIR=${OUTPUT_DIR:-results/ar_run}
+
+mkdir -p "$OUTPUT_DIR"
+python3 records/capture_environment.py > "$OUTPUT_DIR/environment.json"
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_ar \
   --model "${MODEL:-d12}" \
@@ -44,7 +223,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_a
   --num_checkpoints "${NUM_CHECKPOINTS:-1}" \
   --learning_rate "${LEARNING_RATE:-3e-4}" \
   --warmup_iters "${WARMUP_ITERS:-320}" \
-  --seed "${SEED:-1337}" \
+  --seed "${SEED:-1}" \
   --val_loss_every "${VAL_LOSS_EVERY:-500}" \
   --val_max_steps "${VAL_MAX_STEPS:-8}" \
   --output_dir "$OUTPUT_DIR" \
@@ -54,6 +233,10 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_a
 ===== run_dlm.sh =====
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Keep mounted home directories from overriding the versions installed in the
+# official container image.
+export PYTHONNOUSERSITE=1
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 OUTPUT_DIR=${OUTPUT_DIR:-results/dlm_run}
@@ -75,7 +258,7 @@ if [[ -n "${CHECKPOINT_STEPS:-}" ]]; then
   CHECKPOINT_STEPS_ARGS+=(--checkpoint_steps "$CHECKPOINT_STEPS")
 fi
 DUO_ARGS=(
-  --duo_curriculum_mode "${DLM_DUO_CURRICULUM_MODE:-softmax}"
+  --duo_curriculum_mode "${DLM_DUO_CURRICULUM_MODE:-dense_softmax}"
   --duo_keep_prob_table_path "${DLM_DUO_KEEP_PROB_TABLE_PATH:-}"
   --duo_top_k "${DLM_DUO_TOP_K:-32}"
   --duo_log_noise_ratio_min "${DLM_DUO_LOG_NOISE_RATIO_MIN:--3.55}"
@@ -85,6 +268,9 @@ DUO_ARGS=(
   --duo_curriculum_start "${DLM_DUO_CURRICULUM_START:-0}"
   --duo_curriculum_end "${DLM_DUO_CURRICULUM_END:-500000}"
 )
+
+mkdir -p "$OUTPUT_DIR"
+python3 records/capture_environment.py > "$OUTPUT_DIR/environment.json"
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_dlm \
   --model "${MODEL:-d12}" \
@@ -107,13 +293,188 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m speedrun_dlm.train_d
   --cond_dim "${DLM_COND_DIM:-128}" \
   --dropout "${DLM_DROPOUT:-0.1}" \
   --warmup_iters "${WARMUP_ITERS:-384}" \
-  --seed "${SEED:-1337}" \
+  --seed "${SEED:-1}" \
   --val_loss_every "${VAL_LOSS_EVERY:-5040}" \
   --val_max_steps "${VAL_MAX_STEPS:-8}" \
   --output_dir "$OUTPUT_DIR" \
   "${D3PM_COEFF_ARGS[@]}" \
   "${DUO_ARGS[@]}" \
   "$@"
+
+
+===== records/capture_environment.py =====
+#!/usr/bin/env python3
+"""Print a JSON snapshot of the environment used for a benchmark run."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from importlib import metadata
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PACKAGES = [
+    "torch",
+    "triton",
+    "numpy",
+    "transformers",
+    "huggingface-hub",
+    "datasets",
+    "tiktoken",
+    "safetensors",
+    "tqdm",
+]
+
+
+def run_command(command: list[str], timeout: float = 10.0) -> dict[str, Any] | None:
+    executable = shutil.which(command[0])
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, *command[1:]],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return {"command": command, "error": repr(exc)}
+    output = {"command": command, "returncode": result.returncode}
+    if result.stdout.strip():
+        output["stdout"] = result.stdout.strip()
+    if result.stderr.strip():
+        output["stderr"] = result.stderr.strip()
+    return output
+
+
+def package_versions(names: list[str]) -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in names:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def torch_environment() -> dict[str, Any]:
+    try:
+        import torch
+    except Exception as exc:
+        return {"import_error": repr(exc)}
+
+    info: dict[str, Any] = {
+        "version": torch.__version__,
+        "compiled_cuda": torch.version.cuda,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()),
+        "cudnn_version": torch.backends.cudnn.version(),
+    }
+    if torch.cuda.is_available():
+        devices = []
+        for index in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(index)
+            devices.append(
+                {
+                    "index": index,
+                    "name": props.name,
+                    "capability": [props.major, props.minor],
+                    "total_memory_bytes": props.total_memory,
+                    "multi_processor_count": props.multi_processor_count,
+                }
+            )
+        info["cuda_devices"] = devices
+    return info
+
+
+def git_environment() -> dict[str, Any]:
+    head = run_command(["git", "rev-parse", "HEAD"])
+    branch = run_command(["git", "branch", "--show-current"])
+    status = run_command(["git", "status", "--short"])
+    dirty = None
+    if status and status.get("returncode") == 0:
+        dirty = bool(status.get("stdout"))
+    return {
+        "head": head.get("stdout") if head and head.get("returncode") == 0 else None,
+        "branch": branch.get("stdout") if branch and branch.get("returncode") == 0 else None,
+        "dirty": dirty,
+    }
+
+
+def nvidia_environment() -> dict[str, Any]:
+    summary = run_command(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    return {
+        "gpu_summary": summary,
+        "nvcc": run_command(["nvcc", "--version"]),
+    }
+
+
+def build_snapshot(package_names: list[str]) -> dict[str, Any]:
+    return {
+        "schema": "speedrun-dlm-environment-v1",
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "python": {
+            "version": sys.version,
+            "implementation": platform.python_implementation(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+        },
+        "packages": package_versions(package_names),
+        "torch": torch_environment(),
+        "nvidia": nvidia_environment(),
+        "git": git_environment(),
+        "environment": {
+            key: os.environ[key]
+            for key in [
+                "CUDA_VISIBLE_DEVICES",
+                "NCCL_DEBUG",
+                "NCCL_IB_DISABLE",
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "TORCH_CUDNN_V8_API_ENABLED",
+            ]
+            if key in os.environ
+        },
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Print environment metadata as JSON.")
+    parser.add_argument(
+        "--package",
+        action="append",
+        default=[],
+        help="Extra Python package name to include. Can be repeated.",
+    )
+    args = parser.parse_args()
+    package_names = sorted(set(DEFAULT_PACKAGES + args.package))
+    print(json.dumps(build_snapshot(package_names), indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
 
 
 ===== speedrun_dlm/train_ar.py =====
@@ -351,7 +712,7 @@ def main():
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--val_loss_every", type=int, default=0)
     parser.add_argument("--val_max_steps", type=int, default=20)
     parser.add_argument(
@@ -614,13 +975,16 @@ if __name__ == "__main__":
 ===== speedrun_dlm/train_dlm.py =====
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
 import pickle
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -640,6 +1004,13 @@ DATA_FILE_VERSION = 1
 DUO_KEEP_PROB_EPS = 1e-6  # DUO keep probs are clamped away from zero
 DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN = 1e-4
 DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX = 20.0
+DUO_CURRICULUM_MODES = ("dense_softmax", "topk_softmax")
+DUO_KEEP_PROB_TABLE_COMMIT = "492505208b361fa330f4703b705abc54cf7ead20"
+DUO_KEEP_PROB_TABLE_SHA256 = "19e3ff05d86f033a99df864087c40b5e5c55fd9dc5f1a863e712b0f376b85b30"
+DUO_KEEP_PROB_TABLE_URL = (
+    "https://raw.githubusercontent.com/s-sahoo/duo/"
+    f"{DUO_KEEP_PROB_TABLE_COMMIT}/integral/gpt2.pkl"
+)
 
 
 @dataclass(frozen=True)
@@ -664,6 +1035,13 @@ DLM_OBJECTIVES = {
 
 def is_d3pm_objective(objective: str) -> bool:
     return DLM_OBJECTIVES[objective].d3pm_default_coeffs is not None
+
+
+def check_duo_curriculum_mode(mode: str) -> str:
+    if mode not in DUO_CURRICULUM_MODES:
+        choices = ", ".join(DUO_CURRICULUM_MODES)
+        raise ValueError(f"Unsupported DUO curriculum mode: {mode!r}. Choose one of: {choices}.")
+    return mode
 
 
 # =============================================================================
@@ -1143,14 +1521,60 @@ def sample_uniform_forward_marginal(
     return torch.where(keep_mask, clean_tokens, random_tokens)
 
 
-def load_duo_keep_prob_table(path: str, device: str) -> dict[str, torch.Tensor | float | int]:
+def default_duo_keep_prob_table_path() -> str:
+    cache_root = os.environ.get("SPEEDRUN_DLM_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "speedrun-dlm"))
+    return os.path.join(cache_root, "duo", f"gpt2-{DUO_KEEP_PROB_TABLE_COMMIT[:12]}.pkl")
+
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_duo_keep_prob_table(path: str) -> str:
     if not path:
-        raise ValueError(
-            "objective=duo_uniform requires --duo_keep_prob_table_path from the official DUO keep probability table."
-        )
+        path = default_duo_keep_prob_table_path()
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".duo-table-", suffix=".pkl", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            with urlopen(DUO_KEEP_PROB_TABLE_URL, timeout=60) as response:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        actual_sha256 = file_sha256(tmp_path)
+        if actual_sha256 != DUO_KEEP_PROB_TABLE_SHA256:
+            raise ValueError(
+                "downloaded DUO keep-probability table checksum mismatch: "
+                f"expected {DUO_KEEP_PROB_TABLE_SHA256}, got {actual_sha256}"
+            )
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def load_duo_keep_prob_table(path: str, device: str) -> dict[str, torch.Tensor | float | int]:
+    path = ensure_duo_keep_prob_table(path)
     with open(path, "rb") as f:
         data = pickle.load(f)
-    # DUO table stores the gaussian argmax map so training does not integrate it each step
+    # DUO samples a gaussian latent at log-noise ratio gamma
+    # the DUO loss depends on the keep_prob of the uniform marginals obtained by argmaxing that gaussian latent
+    # this function loads a precomputed table, pt, used to get keep_prob as a function of gamma:
+    # pt stores P(argmax gaussian latent is still the clean token) as a function of gamma, precomputed once since it is a gaussian max probability over vocab_size competitors
+    # it is converted to keep_prob via P(clean) = pt[gamma] in Gaussian formulation = keep_prob + (1 - keep_prob) / vocab_size in uniform formulation
+    # so keep_prob = (vocab_size * pt[gamma] - 1) / (vocab_size - 1), see duo_keep_prob_from_table() for the conversion
     required = {"vocab_size", "gamma_min", "gamma_max", "num_points", "pt"}
     missing = required.difference(data)
     if missing:
@@ -1160,7 +1584,7 @@ def load_duo_keep_prob_table(path: str, device: str) -> dict[str, torch.Tensor |
         "log_noise_ratio_min": float(data["gamma_min"]),
         "log_noise_ratio_max": float(data["gamma_max"]),
         "num_points": int(data["num_points"]),
-        "uniform_state_prob": torch.as_tensor(data["pt"], device=device),
+        "clean_argmax_prob": torch.as_tensor(data["pt"], device=device),
     }
 
 
@@ -1169,7 +1593,7 @@ def duo_keep_prob_from_table(
     table: dict[str, torch.Tensor | float | int],
     vocab_size: int,
 ) -> torch.Tensor:
-    # DUO table gives clean argmax prob convert to uniform keep prob
+    # DUO table gives clean argmax prob, this function converts to uniform keep prob, see comments in load_duo_keep_prob_table()
     log_noise_ratio_min = float(table["log_noise_ratio_min"])
     log_noise_ratio_max = float(table["log_noise_ratio_max"])
     num_points = int(table["num_points"])
@@ -1177,8 +1601,8 @@ def duo_keep_prob_from_table(
     indices = torch.round(
         (num_points - 1) * (log_noise_ratio - log_noise_ratio_min) / (log_noise_ratio_max - log_noise_ratio_min)
     ).long()
-    uniform_state_prob = table["uniform_state_prob"][indices]
-    return (vocab_size * uniform_state_prob - 1) / (vocab_size - 1)
+    clean_argmax_prob = table["clean_argmax_prob"][indices]
+    return (vocab_size * clean_argmax_prob - 1) / (vocab_size - 1)
 
 
 def duo_keep_prob_and_rate_from_table(
@@ -1279,10 +1703,10 @@ def sample_duo_tempered_softmax_topk(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # target: softmax(inverse_temperature * noisy_vocab_vector) without materializing all vocab columns
     # sample the top-k non-clean competitors, add the clean token candidate, and integrate the remaining tail
-    # DUO topk gaussian relaxation
+    # DUO topk-softmax gaussian relaxation
     # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/utils.py#L529-L655
     if k < 2 or k >= vocab_size:
-        raise ValueError(f"DUO topk requires 2 <= k < vocab_size, got k={k}, vocab_size={vocab_size}.")
+        raise ValueError(f"DUO topk-softmax requires 2 <= k < vocab_size, got k={k}, vocab_size={vocab_size}.")
     clean_scale = clean_scale.to(torch.float64)
     noise_scale = noise_scale.to(torch.float64)
     extra, top_k, is_extra_in_topk = _sample_topk_and_extra(vocab_size, clean_scale, noise_scale, length, k)
@@ -1319,23 +1743,23 @@ def sample_duo_forward_relaxation(
     inverse_temperature: float,
     vocab_size: int,
 ) -> torch.Tensor:
-    # DUO softmax and topk curricula
+    # DUO dense-softmax and topk-softmax curricula
     # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L582-L636
+    curriculum_mode = check_duo_curriculum_mode(curriculum_mode)
     clean_scale = torch.sigmoid(-time_batch.duo_log_noise_ratio).sqrt()
     noise_scale = torch.sigmoid(time_batch.duo_log_noise_ratio).sqrt()
-    if curriculum_mode == "softmax":
+    if curriculum_mode == "dense_softmax":
         # DUO replaces exact argmax input with a full vocab softmax
-        # DUO softmax builds dense batch seq vocab tensors so memory gets huge
+        # DUO dense-softmax builds dense batch seq vocab tensors so memory gets huge
         x0_one_hot = F.one_hot(clean_tokens, vocab_size).to(torch.float32)
         xt = clean_scale[:, None, None] * x0_one_hot + noise_scale[:, None, None] * torch.randn_like(x0_one_hot)
         xt = xt * inverse_temperature
         time_batch.duo_discrete_noisy_tokens = xt.argmax(-1)
         time_batch.duo_sparse_input_weights = None
         return xt
-    if curriculum_mode != "topk":
+    if curriculum_mode != "topk_softmax":
         raise NotImplementedError(f"Unsupported DUO curriculum mode: {curriculum_mode!r}.")
-    # DUO topk keeps sparse softmax weights instead of all vocab columns
-    # DUO topk stores batch seq k weights but logits and loss still use vocab
+    # DUO topk-softmax keeps sparse softmax weights instead of all vocab columns
     weights, indices, xt_usdm = sample_duo_tempered_softmax_topk(
         extra_index=clean_tokens,
         clean_scale=clean_scale,
@@ -1357,7 +1781,7 @@ def sample_forward_marginal(
     noise_type: str,
     mask_token_id: int,
     vocab_size: int,
-    duo_curriculum_mode: str = "softmax",
+    duo_curriculum_mode: str = "dense_softmax",
     duo_top_k: int = 32,
     duo_input_inverse_temperature: float = 1.0,
 ) -> torch.Tensor:
@@ -1615,7 +2039,6 @@ def sedd_uniform_loss(
     time_batch: TimeBatch,
     vocab_size: int,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    # Complete-state score entropy:
     # https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/graph_lib.py#L116-L189
     log_scores = raw_logits.float()
     log_scores = torch.scatter(log_scores, -1, noisy_tokens.unsqueeze(-1), torch.zeros_like(log_scores[..., :1]))
@@ -1651,7 +2074,6 @@ def duo_uniform_nll_per_token(
     keep_prob_rate: torch.Tensor,  # [batch, 1]
     vocab_size: int,
 ) -> torch.Tensor:
-    # not plain ce because DUO scores the full noisy marginal
     # this is the continuous time uniform state nll using keep prob and its rate
     # https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/algo.py#L337-L372
     pred_clean_probs = F.softmax(raw_logits.float(), dim=-1)
@@ -1886,7 +2308,7 @@ def main():
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_eps", type=float, default=1e-8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--val_loss_every", type=int, default=0)
     parser.add_argument("--val_max_steps", type=int, default=20)
     parser.add_argument("--num_checkpoints", type=int, default=1)
@@ -1908,12 +2330,17 @@ def main():
     )
     parser.add_argument("--d3pm_vb_coeff", type=float, default=None)
     parser.add_argument("--d3pm_ce_coeff", type=float, default=None)
-    parser.add_argument("--duo_curriculum_mode", choices=("softmax", "topk"), default="softmax")
+    parser.add_argument(
+        "--duo_curriculum_mode",
+        choices=DUO_CURRICULUM_MODES,
+        default="dense_softmax",
+        help="DUO input relaxation: dense_softmax materializes [B,L,V]; topk_softmax uses sparse top-k weights.",
+    )
     parser.add_argument(
         "--duo_keep_prob_table_path",
         type=str,
         default="",
-        help="Pickle table mapping DUO gaussian log noise ratio to uniform keep probability.",
+        help="Pickle table mapping DUO gaussian log noise ratio to uniform keep probability; downloaded to cache if omitted.",
     )
     parser.add_argument("--duo_top_k", type=int, default=32)
     parser.add_argument("--duo_log_noise_ratio_min", type=float, default=-3.55)
@@ -1937,6 +2364,7 @@ def main():
     parser.add_argument("--no_antithetic_sampling", dest="antithetic_sampling", action="store_false")
     parser.set_defaults(antithetic_sampling=True)
     args = parser.parse_args()
+    args.duo_curriculum_mode = check_duo_curriculum_mode(args.duo_curriculum_mode)
 
     batch_size, seq_len = args.batch_size, args.sequence_length
     if not (1 <= seq_len <= 1024):
@@ -1959,8 +2387,8 @@ def main():
         if args.d3pm_vb_coeff == 0 and args.d3pm_ce_coeff == 0:
             raise ValueError("At least one D3PM coefficient must be positive.")
     if args.objective == "duo_uniform":
-        if args.duo_curriculum_mode == "topk" and args.duo_top_k < 2:
-            raise ValueError("--duo_top_k must be >=2 for DUO topk curriculum.")
+        if args.duo_curriculum_mode == "topk_softmax" and args.duo_top_k < 2:
+            raise ValueError("--duo_top_k must be >=2 for DUO topk_softmax curriculum.")
         if not args.time_conditioning:
             print0("objective=duo_uniform follows official DUO UniformState and requires time_conditioning; enabling it.")
             args.time_conditioning = True
@@ -2370,6 +2798,149 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+===== speedrun_dlm/checkpoint_utils.py =====
+from contextlib import nullcontext
+from dataclasses import dataclass
+
+import tiktoken
+import torch
+import torch.nn.functional as F
+
+from .train_ar import GPT, get_model_config as get_ar_model_config
+from .train_dlm import (
+    DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+    DiffusionTransformer,
+    get_model_config as get_dlm_model_config,
+    keep_prob_from_time,
+    total_noise_rate_from_time,
+)
+
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+
+@dataclass
+class LoadedSnapshot:
+    trainer: str
+    model: torch.nn.Module
+    args: dict
+    checkpoint_variant: str
+
+
+def resolve_amp_dtype(device: str, amp_dtype: str) -> str:
+    if amp_dtype == "auto":
+        return "bfloat16" if device.startswith("cuda") else "none"
+    return amp_dtype
+
+
+def autocast_context(device: str, amp_dtype: str):
+    if device.startswith("cuda") and amp_dtype == "bfloat16":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def load_snapshot(snapshot_path: str, device: str, checkpoint_variant: str = "auto") -> LoadedSnapshot:
+    checkpoint = torch.load(snapshot_path, map_location="cpu")
+    trainer = checkpoint.get("trainer")
+    args = checkpoint["args"]
+    if trainer == "ar":
+        model = GPT(get_ar_model_config(args["model"]))
+    elif trainer == "dlm":
+        model = DiffusionTransformer(
+            get_dlm_model_config(
+                args["model"],
+                cond_dim=int(args.get("cond_dim", 128)),
+                dropout=float(args.get("dropout", 0.1)),
+                time_conditioning=bool(args.get("time_conditioning", False)),
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported trainer in snapshot: {trainer}")
+
+    if checkpoint_variant == "auto":
+        state_dict_key = "ema_model" if checkpoint.get("ema_model") is not None else "model"
+    elif checkpoint_variant in {"model", "ema_model"}:
+        if checkpoint.get(checkpoint_variant) is None:
+            raise ValueError(f"Checkpoint variant {checkpoint_variant!r} not found in snapshot: {snapshot_path}")
+        state_dict_key = checkpoint_variant
+    else:
+        raise ValueError(f"Unsupported checkpoint variant: {checkpoint_variant}")
+
+    state_dict = checkpoint[state_dict_key]
+    if any(key.startswith("_orig_mod.") for key in state_dict):
+        state_dict = {key.removeprefix("_orig_mod."): value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return LoadedSnapshot(trainer=trainer, model=model, args=args, checkpoint_variant=state_dict_key)
+
+
+def make_d3pm_sampling_keep_prob_grid(
+    num_sampling_steps: int,
+    noise_schedule: str,
+    eps: float,
+    device: str,
+    geometric_noise_level_min: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
+    geometric_noise_level_max: float = DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
+    terminal_zero: bool = True,
+) -> torch.Tensor:
+    # D3PM sampling: t_i=i/S, mapped through the training noise schedule.
+    # The endpoints are forced to fully clean and, when requested, fully noisy.
+    times = torch.linspace(0.0, 1.0, num_sampling_steps + 1, device=device, dtype=torch.float32)
+    keep_grid = keep_prob_from_time(
+        times,
+        noise_schedule,
+        eps,
+        geometric_noise_level_min,
+        geometric_noise_level_max,
+    )
+    keep_grid[0] = 1.0
+    if terminal_zero:
+        keep_grid[-1] = 0.0
+    return keep_grid
+
+
+def model_time_from_keep_prob(
+    args: dict,
+    keep_grid: torch.Tensor,
+    step: int,
+    batch_size: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    if args.get("objective") in {"d3pm_mask", "d3pm_uniform"}:
+        # D3PM training conditions on the discrete time coordinate, not on
+        # total_noise. Keep this tied to the sampled grid when using fewer
+        # reverse steps than the training grid.
+        value = float(step) / max(float(keep_grid.numel() - 1), 1.0)
+        return torch.full((batch_size,), value, dtype=torch.float32, device=device)
+    eps = float(args.get("continuous_time_eps", 1e-3))
+    value = float((-torch.log(keep_grid[step].clamp_min(eps))).item())
+    return torch.full((batch_size,), value, dtype=torch.float32, device=device)
+
+
+def masked_x0_logprobs(
+    raw_logits: torch.Tensor,
+    noisy_tokens: torch.Tensor,
+    mask_token_id: int,
+    preserve_unmasked: bool,
+) -> torch.Tensor:
+    logprobs = F.log_softmax(raw_logits.float(), dim=-1)
+    if not preserve_unmasked:
+        return logprobs
+
+    unmasked = noisy_tokens.ne(mask_token_id)
+    if not unmasked.any():
+        return logprobs
+
+    forced_tokens = noisy_tokens.masked_fill(~unmasked, 0)
+    forced_token_values = logprobs.gather(-1, forced_tokens.unsqueeze(-1)).squeeze(-1)
+    forced_token_values = torch.where(unmasked, torch.zeros_like(forced_token_values), forced_token_values)
+    logprobs = logprobs.masked_fill(unmasked.unsqueeze(-1), float("-inf"))
+    logprobs.scatter_(-1, forced_tokens.unsqueeze(-1), forced_token_values.unsqueeze(-1))
+    return logprobs
 
 
 ===== speedrun_dlm/sample_text.py =====
@@ -3668,7 +4239,7 @@ def main() -> None:
     parser.add_argument("--samples_per_prompt", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
@@ -3708,10 +4279,10 @@ def main() -> None:
     sample_index = 0
     while sample_index < args.samples_per_prompt:
         chunk_start = time.perf_counter()
+        batch_seed = args.seed + sample_index
         if snapshot.trainer == "ar":
             chunk_size = 1
-            local_seed = args.seed + sample_index
-            generator.manual_seed(local_seed)
+            generator.manual_seed(batch_seed)
             tokens = sample_ar(
                 snapshot.model,
                 [getattr(tokenizer, "eot_token", 50256)],
@@ -3725,7 +4296,7 @@ def main() -> None:
             token_batches = [tokens]
         elif snapshot.trainer == "dlm":
             chunk_size = min(max(1, args.sampling_batch_size), args.samples_per_prompt - sample_index)
-            generator.manual_seed(args.seed + sample_index)
+            generator.manual_seed(batch_seed)
             token_batches = sample_dlm(
                 snapshot.model,
                 snapshot.args,
@@ -3745,13 +4316,12 @@ def main() -> None:
 
         for offset, tokens in enumerate(token_batches):
             current_index = sample_index + offset
-            local_seed = args.seed + current_index
             text = tokenizer.decode(tokens)
             rows.append(
                 {
                     "prompt_index": 0,
                     "sample_index": current_index,
-                    "seed": local_seed,
+                    "seed": batch_seed,
                     "trainer": snapshot.trainer,
                     "protocol": "unconditional",
                     "sample_mode": "unconditional",
@@ -3786,6 +4356,7 @@ def main() -> None:
     payload = {
         "snapshot": checkpoint_label(args.snapshot_path),
         "trainer": snapshot.trainer,
+        "training_seed": snapshot.args.get("seed"),
         "checkpoint_variant": snapshot.checkpoint_variant,
         "sample_mode": "unconditional",
         "samples": rows,
@@ -3813,11 +4384,1221 @@ if __name__ == "__main__":
     main()
 
 
+===== speedrun_dlm/_quality_metrics.py =====
+"""Internal scoring implementation for the generation-quality gate.
+
+The public entry point is python -m speedrun_dlm.score_generation_quality.
+This module scores generated sample sets and writes per-sample metrics.
+"""
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import random
+import re
+import statistics
+import time
+import zlib
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+from .score_generation_quality import SEED_PROTOCOL, checkpoint_evaluation_seeds
+
+
+TOKEN_RE = re.compile(r"\S+")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SENTENCE_RE = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
+DOC_COHERENCE_KINDS = (
+    "shuffle",
+    "local_swap",
+    "sentence_replacement",
+    "block_replacement",
+    "tail_splice",
+)
+
+
+def timing(stage: str, seconds: float, **fields: Any) -> None:
+    suffix = "".join(f" {key}={value}" for key, value in fields.items())
+    print(f"TIMING quality_metrics.{stage} seconds={seconds:.3f}{suffix}", flush=True)
+
+
+def ngram_repeat_ratio(tokens: list[str], n: int) -> float:
+    if len(tokens) < n:
+        return 0.0
+    grams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+    return 1.0 - (len(set(grams)) / len(grams))
+
+
+def max_run(tokens: list[str]) -> int:
+    if not tokens:
+        return 0
+    best = 1
+    cur = 1
+    prev = tokens[0]
+    for token in tokens[1:]:
+        if token == prev:
+            cur += 1
+        else:
+            best = max(best, cur)
+            cur = 1
+            prev = token
+    return max(best, cur)
+
+
+def split_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    sentences = [match.group(0).strip() for match in SENTENCE_RE.finditer(normalized)]
+    return [sentence for sentence in sentences if sentence]
+
+
+def sentence_token_count(sentence: str) -> int:
+    return len(TOKEN_RE.findall(sentence))
+
+
+def deterministic_metrics(text: str) -> dict[str, float]:
+    raw = text.encode("utf-8", errors="replace")
+    tokens = TOKEN_RE.findall(text)
+    lower_tokens = [token.lower() for token in tokens]
+    chars = len(text)
+    bytes_len = len(raw)
+    compressed = len(zlib.compress(raw)) if raw else 0
+    line_count = text.count("\n") + (1 if text else 0)
+    eot_count = text.count("<|endoftext|>")
+    mask_count = text.count("<|mask|>") + text.count("[MASK]") + text.count("<mask>")
+    bad_char_count = text.count("\ufffd") + len(CONTROL_RE.findall(text))
+
+    return {
+        "char_count": float(chars),
+        "byte_count": float(bytes_len),
+        "whitespace_token_count": float(len(tokens)),
+        "line_count": float(line_count),
+        "unique_token_ratio": (len(set(lower_tokens)) / len(lower_tokens)) if lower_tokens else 0.0,
+        "repeat_bigram_ratio": ngram_repeat_ratio(lower_tokens, 2),
+        "repeat_trigram_ratio": ngram_repeat_ratio(lower_tokens, 3),
+        "repeat_4gram_ratio": ngram_repeat_ratio(lower_tokens, 4),
+        "max_token_run": float(max_run(lower_tokens)),
+        "compression_ratio": (compressed / bytes_len) if bytes_len else 0.0,
+        "eot_count": float(eot_count),
+        "mask_token_count": float(mask_count),
+        "bad_char_count": float(bad_char_count),
+    }
+
+def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else float("nan")
+
+
+def median(xs: list[float]) -> float:
+    return statistics.median(xs) if xs else float("nan")
+
+
+def finite(value: float | None) -> bool:
+    return value is not None and not math.isnan(value) and not math.isinf(value)
+
+
+def stable_int(text: str) -> int:
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def load_sample_manifest(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text())
+    if data.get("version") != 1:
+        raise ValueError(f"Unsupported sample-manifest version in {path}")
+    return data
+
+
+def normalize_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("samples"), list):
+        return payload["samples"]
+    raise ValueError("Sample JSON must be either a list or a dict with a 'samples' list.")
+
+
+def normalize_sample(sample_set: dict[str, Any], item: dict[str, Any], index: int) -> dict[str, str]:
+    prompt = str(item.get("prompt") or "")
+    continuation = item.get("continuation")
+    generated = item.get("generated_text")
+    full_text = item.get("full_text")
+
+    if continuation is None:
+        if generated is not None:
+            continuation = generated
+        elif full_text is not None and prompt and str(full_text).startswith(prompt):
+            continuation = str(full_text)[len(prompt) :]
+        elif full_text is not None:
+            continuation = full_text
+        else:
+            continuation = ""
+
+    if full_text is None:
+        if generated is not None:
+            full_text = generated
+        else:
+            full_text = f"{prompt}{continuation}"
+
+    protocol = str(sample_set.get("protocol") or item.get("sample_mode") or item.get("mode") or "unknown")
+    if protocol == "unconditional":
+        score_prompt = ""
+        score_target = str(generated if generated is not None else full_text)
+    else:
+        score_prompt = prompt
+        score_target = str(continuation)
+
+    return {
+        "sample_set": str(sample_set["name"]),
+        "family": str(sample_set.get("family", "")),
+        "protocol": protocol,
+        "gate_label": str(sample_set.get("gate_label", "")),
+        "subjective_tier": "" if sample_set.get("subjective_tier") is None else str(sample_set["subjective_tier"]),
+        "sample_index_global": str(index),
+        "prompt_index": str(item.get("prompt_index", "")),
+        "sample_index": str(item.get("sample_index", "")),
+        "seed": str(item.get("seed", "")),
+        "prompt": prompt,
+        "target_text": score_target,
+        "full_text": str(full_text),
+    }
+
+
+def make_sample(
+    sample_set: str,
+    family: str,
+    protocol: str,
+    gate_label: str,
+    subjective_tier: float | None,
+    index: int,
+    text: str,
+    prompt: str = "",
+) -> dict[str, str]:
+    return {
+        "sample_set": sample_set,
+        "family": family,
+        "protocol": protocol,
+        "gate_label": gate_label,
+        "subjective_tier": "" if subjective_tier is None else str(subjective_tier),
+        "sample_index_global": str(index),
+        "prompt_index": "control",
+        "sample_index": str(index),
+        "seed": "control",
+        "prompt": prompt,
+        "target_text": text,
+        "full_text": f"{prompt}{text}",
+    }
+
+
+def window_text(text: str, max_chars: int = 4096) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_period = cut.rfind(". ")
+    if last_period > max_chars // 2:
+        return cut[: last_period + 1]
+    return cut
+
+
+def load_fineweb_controls(
+    count: int,
+    seed: int,
+    dataset_name: str,
+    dataset_config: str,
+    pinned_fineweb: str,
+    allow_fallback: bool,
+) -> list[dict[str, str]]:
+    if count <= 0:
+        return []
+    try:
+        from datasets import load_dataset
+
+        dataset = load_dataset(
+            dataset_name,
+            name=dataset_config,
+            split="train",
+            streaming=True,
+            revision=pinned_fineweb or None,
+        )
+        controls: list[dict[str, str]] = []
+        # `skip` gives us a deterministic, cheap offset away from the first rows.
+        for item in dataset.skip(seed % 1000):
+            text = window_text(str(item.get("text") or ""))
+            if len(text.split()) < 80:
+                continue
+            controls.append(
+                make_sample(
+                    sample_set="control_fineweb_real_text",
+                    family="control_real_text",
+                    protocol="real_text",
+                    gate_label="reference_pass",
+                    subjective_tier=5.0,
+                    index=len(controls),
+                    text=text,
+                )
+            )
+            if len(controls) >= count:
+                return controls
+    except Exception as exc:
+        if not allow_fallback:
+            raise RuntimeError(
+                "Could not load FineWeb controls. Set --allow_fineweb_fallback only for local smoke tests."
+            ) from exc
+
+    fallback = [
+        "The city council released the annual transport report after months of public consultation. "
+        "The document compares ridership, maintenance costs, and accident reports across several "
+        "neighborhoods, and recommends adding bus lanes on corridors where average speeds have "
+        "fallen during the morning commute. Officials said the proposal would be reviewed again "
+        "after the summer construction season.",
+        "Researchers studying coastal wetlands described a gradual recovery in several marshes "
+        "after restoration crews reopened tidal channels and removed invasive plants. The report "
+        "notes that bird counts remain below historical levels, but water quality and juvenile "
+        "fish surveys improved for the third consecutive year.",
+    ]
+    return [
+        make_sample(
+            sample_set="control_fallback_real_text",
+            family="control_real_text",
+            protocol="real_text",
+            gate_label="reference_pass",
+            subjective_tier=5.0,
+            index=i,
+            text=window_text(text),
+        )
+        for i, text in enumerate((fallback * ((count // len(fallback)) + 1))[:count])
+    ]
+
+class ReferenceLMScorer:
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        dtype: str,
+        max_eval_tokens: int,
+        score_batch_size: int,
+        trust_remote_code: bool,
+        device_map: str,
+        pinned_reference_model: str = "",
+    ) -> None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.torch = torch
+        self.model_name = model_name
+        self.max_eval_tokens = max_eval_tokens
+        self.score_batch_size = max(1, score_batch_size)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            revision=pinned_reference_model or None,
+        )
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if dtype == "bfloat16":
+            torch_dtype = torch.bfloat16
+        elif dtype == "float16":
+            torch_dtype = torch.float16
+        elif dtype == "float32":
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = "auto"
+
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        load_kwargs: dict[str, Any] = {
+            "dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+        }
+        if pinned_reference_model:
+            load_kwargs["revision"] = pinned_reference_model
+        if device_map:
+            load_kwargs["device_map"] = device_map
+            load_kwargs["low_cpu_mem_usage"] = True
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        if not device_map:
+            self.model.to(device)
+        self.model.eval()
+        self.input_device = next(self.model.parameters()).device
+        model_context_candidates = [
+            getattr(self.model.config, "max_position_embeddings", None),
+            getattr(self.model.config, "n_positions", None),
+            getattr(self.tokenizer, "model_max_length", None),
+        ]
+        model_contexts = [
+            int(value)
+            for value in model_context_candidates
+            if isinstance(value, int) and 0 < value < 1_000_000
+        ]
+        if model_contexts:
+            self.max_eval_tokens = min(self.max_eval_tokens, min(model_contexts))
+            print(
+                f"Reference LM context cap for {model_name}: "
+                f"using max_eval_tokens={self.max_eval_tokens}",
+                flush=True,
+            )
+
+    def encode(self, text: str) -> list[int]:
+        return list(self.tokenizer(text, add_special_tokens=False).input_ids)
+
+    def score_targets_batch(
+        self,
+        contexts: list[str],
+        targets: list[str],
+        prepend_bos_if_empty: bool,
+    ) -> list[dict[str, float]]:
+        torch = self.torch
+        if len(contexts) != len(targets):
+            raise ValueError("contexts and targets must have the same length")
+        encoded_contexts = [self.encode(context) if context else [] for context in contexts]
+        encoded_targets = [self.encode(target) for target in targets]
+        bos_id = self.tokenizer.eos_token_id
+
+        sequences: list[list[int]] = []
+        labels: list[list[int]] = []
+        target_bytes: list[int] = []
+        target_counts: list[int] = []
+        for context_ids, target_ids, target in zip(encoded_contexts, encoded_targets, targets, strict=True):
+            context_ids = list(context_ids)
+            target_ids = list(target_ids)
+            if prepend_bos_if_empty and not context_ids and bos_id is not None:
+                context_ids = [int(bos_id)]
+            if len(target_ids) < 1:
+                sequences.append(context_ids or ([int(bos_id)] if bos_id is not None else [0]))
+                labels.append([-100] * len(sequences[-1]))
+                target_bytes.append(max(1, len(target.encode("utf-8", errors="replace"))))
+                target_counts.append(0)
+                continue
+
+            max_len = self.max_eval_tokens
+            # Preserve the full target sentence whenever possible, trimming only
+            # the left side of the context. Sentence-order contrast is local, so
+            # losing very old context is less harmful than truncating candidates.
+            if len(context_ids) + len(target_ids) > max_len:
+                room_for_context = max(1, max_len - len(target_ids))
+                context_ids = context_ids[-room_for_context:]
+            if len(context_ids) + len(target_ids) > max_len:
+                target_ids = target_ids[: max(1, max_len - len(context_ids))]
+
+            input_ids = context_ids + target_ids
+            label_ids = [-100] * len(context_ids) + target_ids
+            if len(input_ids) < 2:
+                if bos_id is not None:
+                    input_ids = [int(bos_id)] + input_ids
+                    label_ids = [-100] + label_ids
+                else:
+                    input_ids = input_ids + [input_ids[-1] if input_ids else 0]
+                    label_ids = label_ids + [-100]
+            sequences.append(input_ids)
+            labels.append(label_ids)
+            target_bytes.append(max(1, len(target.encode("utf-8", errors="replace"))))
+            target_counts.append(len(target_ids))
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = 0
+        nlls: list[float] = []
+        scored_tokens: list[int] = []
+        for start in range(0, len(sequences), self.score_batch_size):
+            batch_sequences = sequences[start : start + self.score_batch_size]
+            batch_labels = labels[start : start + self.score_batch_size]
+            max_batch_len = max(len(seq) for seq in batch_sequences)
+            input_batch = []
+            label_batch = []
+            attention_batch = []
+            for seq, label in zip(batch_sequences, batch_labels, strict=True):
+                pad = max_batch_len - len(seq)
+                input_batch.append(seq + [int(pad_id)] * pad)
+                label_batch.append(label + [-100] * pad)
+                attention_batch.append([1] * len(seq) + [0] * pad)
+
+            ids_tensor = torch.tensor(input_batch, device=self.input_device)
+            labels_tensor = torch.tensor(label_batch, device=self.input_device)
+            attention_tensor = torch.tensor(attention_batch, device=self.input_device)
+            with torch.no_grad():
+                logits = self.model(ids_tensor, attention_mask=attention_tensor).logits[:, :-1, :]
+                shifted_labels = labels_tensor[:, 1:]
+                keep = shifted_labels != -100
+                safe_labels = shifted_labels.masked_fill(~keep, 0)
+                losses = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    safe_labels.reshape(-1),
+                    reduction="none",
+                ).reshape_as(safe_labels)
+                losses = losses.masked_fill(~keep, 0.0)
+                nlls.extend(losses.sum(dim=1).detach().cpu().tolist())
+                scored_tokens.extend(keep.sum(dim=1).detach().cpu().tolist())
+
+        out: list[dict[str, float]] = []
+        for nll, scored, total_target_tokens, n_bytes in zip(
+            nlls,
+            scored_tokens,
+            target_counts,
+            target_bytes,
+            strict=True,
+        ):
+            scored_i = int(scored)
+            nll_f = float(nll)
+            if scored_i == 0:
+                bpb = float("nan")
+                nll_per_token = float("nan")
+            else:
+                bpb = nll_f / (n_bytes * math.log(2))
+                nll_per_token = nll_f / scored_i
+            out.append(
+                {
+                    "target_token_count": float(total_target_tokens),
+                    "scored_token_count": float(scored_i),
+                    "nll": nll_f,
+                    "nll_per_token": nll_per_token,
+                    "bpb": bpb,
+                }
+            )
+        return out
+
+    def score(self, prompt: str, target: str) -> dict[str, float]:
+        # Full-sample BPB uses sliding windows; the batched helper above is for short contrast candidates.
+        torch = self.torch
+        prompt_ids = self.encode(prompt) if prompt else []
+        target_ids = self.encode(target)
+        if len(target_ids) < 1:
+            return {
+                "ref_token_count": 0.0,
+                "ref_scored_token_count": 0.0,
+                "ref_nll": float("nan"),
+                "ref_nll_per_token": float("nan"),
+                "ref_ppl": float("nan"),
+                "ref_bpb": float("nan"),
+            }
+
+        input_ids = prompt_ids + target_ids
+        labels = [-100] * len(prompt_ids) + target_ids
+        if len(input_ids) < 2:
+            return {
+                "ref_token_count": float(len(input_ids)),
+                "ref_scored_token_count": 0.0,
+                "ref_nll": float("nan"),
+                "ref_nll_per_token": float("nan"),
+                "ref_ppl": float("nan"),
+                "ref_bpb": float("nan"),
+            }
+
+        max_len = self.max_eval_tokens
+        total_nll = 0.0
+        total_tokens = 0
+        start = 0
+        while start < len(input_ids) - 1:
+            end = min(len(input_ids), start + max_len)
+            chunk_ids = input_ids[start:end]
+            chunk_labels = labels[start:end]
+            if start > 0 and chunk_labels:
+                chunk_labels[0] = -100
+            ids_tensor = torch.tensor([chunk_ids], device=self.input_device)
+            labels_tensor = torch.tensor(chunk_labels, device=self.input_device)
+            with torch.no_grad():
+                logits = self.model(ids_tensor).logits[0, :-1, :]
+                shifted_labels = labels_tensor[1:]
+                keep = shifted_labels != -100
+                if keep.any():
+                    losses = torch.nn.functional.cross_entropy(
+                        logits[keep],
+                        shifted_labels[keep],
+                        reduction="none",
+                    )
+                    total_nll += float(losses.sum().detach().cpu())
+                    total_tokens += int(keep.sum().detach().cpu())
+            if end == len(input_ids):
+                break
+            start = end - 1
+
+        if total_tokens == 0:
+            nll_per_token = float("nan")
+            ppl = float("nan")
+            bpb = float("nan")
+        else:
+            nll_per_token = total_nll / total_tokens
+            ppl = math.exp(min(80.0, nll_per_token))
+            target_bytes = max(1, len(target.encode("utf-8", errors="replace")))
+            bpb = total_nll / (target_bytes * math.log(2))
+
+        return {
+            "ref_token_count": float(len(input_ids)),
+            "ref_scored_token_count": float(total_tokens),
+            "ref_nll": total_nll,
+            "ref_nll_per_token": nll_per_token,
+            "ref_ppl": ppl,
+            "ref_bpb": bpb,
+        }
+
+    def score_order_contrast(
+        self,
+        sample: dict[str, str],
+        sample_index: int,
+        sentence_cache: list[list[str]],
+        candidate_pool: list[tuple[int, str]],
+        pairs_per_sample: int,
+        distractors: int,
+        context_sentences: int,
+        min_sentence_tokens: int,
+        max_sentence_tokens: int,
+        seed: int,
+    ) -> dict[str, float]:
+        sentences = sentence_cache[sample_index]
+        if pairs_per_sample <= 0 or len(sentences) < 2:
+            return empty_order_metrics()
+
+        def valid(sentence: str) -> bool:
+            n_tokens = sentence_token_count(sentence)
+            return min_sentence_tokens <= n_tokens <= max_sentence_tokens
+
+        pair_indices = [
+            i
+            for i in range(len(sentences) - 1)
+            if valid(sentences[i]) and valid(sentences[i + 1])
+        ]
+        if not pair_indices:
+            return empty_order_metrics(sentence_count=len(sentences))
+        rng = random.Random(seed + stable_int(f"{sample['sample_set']}::{sample['sample_index_global']}::{sample['seed']}"))
+        rng.shuffle(pair_indices)
+        pair_indices = pair_indices[:pairs_per_sample]
+
+        external_pool = [(idx, sent) for idx, sent in candidate_pool if idx != sample_index and valid(sent)]
+        same_doc_valid = [j for j, sent in enumerate(sentences) if valid(sent)]
+
+        cross_contexts: list[str] = []
+        cross_targets: list[str] = []
+        cross_slices: list[tuple[int, int]] = []
+        shuffle_contexts: list[str] = []
+        shuffle_targets: list[str] = []
+        shuffle_slices: list[tuple[int, int]] = []
+
+        for pair_index in pair_indices:
+            context = " ".join(sentences[max(0, pair_index + 1 - context_sentences) : pair_index + 1])
+            actual = sentences[pair_index + 1]
+            external_candidates: list[str] = []
+            if external_pool:
+                pool = list(external_pool)
+                rng.shuffle(pool)
+                external_candidates = [sent for _, sent in pool[:distractors]]
+            candidates = [actual] + external_candidates
+            if len(candidates) > 1:
+                start = len(cross_targets)
+                cross_contexts.extend([context] * len(candidates))
+                cross_targets.extend(candidates)
+                cross_slices.append((start, len(cross_targets)))
+
+            shuffled_options = [
+                j
+                for j in same_doc_valid
+                if j not in {pair_index, pair_index + 1}
+                and abs(j - pair_index) > 1
+            ]
+            if shuffled_options:
+                shuffled_target = sentences[rng.choice(shuffled_options)]
+                candidates = [actual, shuffled_target]
+                start = len(shuffle_targets)
+                shuffle_contexts.extend([context, context])
+                shuffle_targets.extend(candidates)
+                shuffle_slices.append((start, len(shuffle_targets)))
+
+        cross_wins = 0
+        cross_margins: list[float] = []
+        cross_actual_gains: list[float] = []
+        cross_distractor_gains: list[float] = []
+        if cross_targets:
+            conditional = self.score_targets_batch(
+                cross_contexts,
+                cross_targets,
+                prepend_bos_if_empty=True,
+            )
+            standalone = self.score_targets_batch(
+                [""] * len(cross_targets),
+                cross_targets,
+                prepend_bos_if_empty=True,
+            )
+            gains = [
+                standalone_row["bpb"] - conditional_row["bpb"]
+                for conditional_row, standalone_row in zip(conditional, standalone, strict=True)
+            ]
+            for start, end in cross_slices:
+                pair_gains = gains[start:end]
+                actual_gain = pair_gains[0]
+                distractor_gains = [gain for gain in pair_gains[1:] if finite(gain)]
+                if finite(actual_gain) and distractor_gains:
+                    best_distractor = max(distractor_gains)
+                    cross_actual_gains.append(actual_gain)
+                    cross_distractor_gains.append(mean(distractor_gains))
+                    margin = actual_gain - best_distractor
+                    cross_margins.append(margin)
+                    if margin > 0:
+                        cross_wins += 1
+
+        shuffle_wins = 0
+        shuffle_margins: list[float] = []
+        shuffle_actual_gains: list[float] = []
+        shuffle_distractor_gains: list[float] = []
+        if shuffle_targets:
+            conditional = self.score_targets_batch(
+                shuffle_contexts,
+                shuffle_targets,
+                prepend_bos_if_empty=True,
+            )
+            standalone = self.score_targets_batch(
+                [""] * len(shuffle_targets),
+                shuffle_targets,
+                prepend_bos_if_empty=True,
+            )
+            gains = [
+                standalone_row["bpb"] - conditional_row["bpb"]
+                for conditional_row, standalone_row in zip(conditional, standalone, strict=True)
+            ]
+            for start, end in shuffle_slices:
+                pair_gains = gains[start:end]
+                if len(pair_gains) != 2:
+                    continue
+                actual_gain, shuffled_gain = pair_gains
+                if finite(actual_gain) and finite(shuffled_gain):
+                    shuffle_actual_gains.append(actual_gain)
+                    shuffle_distractor_gains.append(shuffled_gain)
+                    margin = actual_gain - shuffled_gain
+                    shuffle_margins.append(margin)
+                    if margin > 0:
+                        shuffle_wins += 1
+
+        cross_pairs = len(cross_margins)
+        shuffle_pairs = len(shuffle_margins)
+        return {
+            "order_sentence_count": float(len(sentences)),
+            "order_pair_count": float(cross_pairs),
+            "order_contrast_acc": (cross_wins / cross_pairs) if cross_pairs else float("nan"),
+            "order_contrast_margin_bpb_mean": mean(cross_margins) if cross_margins else float("nan"),
+            "order_contrast_margin_bpb_median": median(cross_margins) if cross_margins else float("nan"),
+            "order_context_gain_bpb_mean": mean(cross_actual_gains) if cross_actual_gains else float("nan"),
+            "order_distractor_gain_bpb_mean": mean(cross_distractor_gains) if cross_distractor_gains else float("nan"),
+            "order_shuffle_pair_count": float(shuffle_pairs),
+            "order_shuffle_acc": (shuffle_wins / shuffle_pairs) if shuffle_pairs else float("nan"),
+            "order_shuffle_margin_bpb_mean": mean(shuffle_margins) if shuffle_margins else float("nan"),
+            "order_shuffle_margin_bpb_median": median(shuffle_margins) if shuffle_margins else float("nan"),
+            "order_shuffle_actual_gain_bpb_mean": mean(shuffle_actual_gains) if shuffle_actual_gains else float("nan"),
+            "order_shuffle_distractor_gain_bpb_mean": mean(shuffle_distractor_gains)
+            if shuffle_distractor_gains
+            else float("nan"),
+        }
+
+    def score_document_coherence(
+        self,
+        sample: dict[str, str],
+        sample_index: int,
+        sentence_cache: list[list[str]],
+        candidate_docs: list[tuple[int, list[str]]],
+        min_sentences: int,
+        max_sentences: int,
+        max_sentence_tokens: int,
+        shuffles: int,
+        swaps: int,
+        replacements: int,
+        block_replacements: int,
+        tail_splices: int,
+        replacement_sentences: int,
+        block_sentences: int,
+        seed: int,
+    ) -> dict[str, float]:
+        sentences = sentence_cache[sample_index]
+
+        def valid(sentence: str) -> bool:
+            n_tokens = sentence_token_count(sentence)
+            return 1 <= n_tokens <= max_sentence_tokens
+
+        valid_sentences = [sentence for sentence in sentences if valid(sentence)]
+        if len(valid_sentences) < min_sentences:
+            return empty_document_coherence_metrics(sentence_count=len(sentences))
+
+        rng = random.Random(seed + stable_int(f"{sample['sample_set']}::{sample['sample_index_global']}::{sample['seed']}"))
+        if len(valid_sentences) > max_sentences:
+            # Use a deterministic contiguous window so corruptions preserve local topic and style.
+            start = rng.randrange(0, len(valid_sentences) - max_sentences + 1)
+            doc_sentences = valid_sentences[start : start + max_sentences]
+        else:
+            doc_sentences = valid_sentences
+
+        def join_doc(items: list[str]) -> str:
+            return " ".join(items)
+
+        corruptions: list[tuple[str, str]] = []
+        for _ in range(max(0, shuffles)):
+            shuffled = list(doc_sentences)
+            rng.shuffle(shuffled)
+            if shuffled != doc_sentences:
+                corruptions.append(("shuffle", join_doc(shuffled)))
+
+        for _ in range(max(0, swaps)):
+            swapped = list(doc_sentences)
+            if len(swapped) >= 2:
+                n_swaps = max(1, len(swapped) // 4)
+                used: set[int] = set()
+                for _ in range(n_swaps):
+                    candidates = [i for i in range(len(swapped) - 1) if i not in used and i + 1 not in used]
+                    if not candidates:
+                        break
+                    i = rng.choice(candidates)
+                    swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+                    used.add(i)
+                    used.add(i + 1)
+                if swapped != doc_sentences:
+                    corruptions.append(("local_swap", join_doc(swapped)))
+
+        external_docs = [
+            (idx, [sentence for sentence in sentences_ if valid(sentence)])
+            for idx, sentences_ in candidate_docs
+            if idx != sample_index
+        ]
+        external_docs = [(idx, sentences_) for idx, sentences_ in external_docs if sentences_]
+        external_pool = [
+            (idx, sentence)
+            for idx, sentences_ in external_docs
+            for sentence in sentences_
+        ]
+        for _ in range(max(0, replacements)):
+            if not external_pool:
+                break
+            replaced = list(doc_sentences)
+            positions = list(range(len(replaced)))
+            rng.shuffle(positions)
+            pool = list(external_pool)
+            rng.shuffle(pool)
+            for pos, (_, sentence) in zip(positions[: max(1, replacement_sentences)], pool, strict=False):
+                replaced[pos] = sentence
+            if replaced != doc_sentences:
+                corruptions.append(("sentence_replacement", join_doc(replaced)))
+
+        for _ in range(max(0, block_replacements)):
+            donor_docs = [
+                donor_sentences
+                for _, donor_sentences in external_docs
+                if donor_sentences and len(doc_sentences) >= 2
+            ]
+            if not donor_docs:
+                break
+            donor = rng.choice(donor_docs)
+            block_len = min(max(1, block_sentences), len(doc_sentences), len(donor))
+            start = rng.randrange(0, len(doc_sentences) - block_len + 1)
+            donor_start = rng.randrange(0, len(donor) - block_len + 1)
+            replaced = list(doc_sentences)
+            replaced[start : start + block_len] = donor[donor_start : donor_start + block_len]
+            if replaced != doc_sentences:
+                corruptions.append(("block_replacement", join_doc(replaced)))
+
+        for _ in range(max(0, tail_splices)):
+            if len(doc_sentences) < 4:
+                break
+            min_tail = max(1, len(doc_sentences) // 3)
+            max_tail = max(min_tail, (2 * len(doc_sentences)) // 3)
+            cut = rng.randrange(len(doc_sentences) - max_tail, len(doc_sentences) - min_tail + 1)
+            tail_len = len(doc_sentences) - cut
+            donor_docs = [donor_sentences for _, donor_sentences in external_docs if len(donor_sentences) >= tail_len]
+            if not donor_docs:
+                break
+            donor = rng.choice(donor_docs)
+            donor_start = rng.randrange(0, len(donor) - tail_len + 1)
+            spliced = doc_sentences[:cut] + donor[donor_start : donor_start + tail_len]
+            if spliced != doc_sentences:
+                corruptions.append(("tail_splice", join_doc(spliced)))
+
+        if not corruptions:
+            return empty_document_coherence_metrics(sentence_count=len(sentences))
+
+        original_doc = join_doc(doc_sentences)
+        texts = [original_doc] + [text for _, text in corruptions]
+        scores = self.score_targets_batch(
+            [""] * len(texts),
+            texts,
+            prepend_bos_if_empty=True,
+        )
+        original_bpb = scores[0]["bpb"]
+        margins_by_kind: dict[str, list[float]] = {}
+        wins_by_kind: dict[str, int] = {}
+        counts_by_kind: dict[str, int] = {}
+        margins: list[float] = []
+        wins = 0
+        for (kind, _), score in zip(corruptions, scores[1:], strict=True):
+            corrupt_bpb = score["bpb"]
+            if not finite(original_bpb) or not finite(corrupt_bpb):
+                continue
+            margin = corrupt_bpb - original_bpb
+            margins.append(margin)
+            margins_by_kind.setdefault(kind, []).append(margin)
+            counts_by_kind[kind] = counts_by_kind.get(kind, 0) + 1
+            if margin > 0:
+                wins += 1
+                wins_by_kind[kind] = wins_by_kind.get(kind, 0) + 1
+
+        count = len(margins)
+        out = {
+            "doc_coherence_sentence_count": float(len(doc_sentences)),
+            "doc_coherence_corruption_count": float(count),
+            "doc_coherence_original_bpb": original_bpb,
+            "doc_coherence_win_rate": (wins / count) if count else float("nan"),
+            "doc_coherence_margin_bpb_mean": mean(margins) if margins else float("nan"),
+            "doc_coherence_margin_bpb_median": median(margins) if margins else float("nan"),
+            "doc_coherence_margin_bpb_min": min(margins) if margins else float("nan"),
+        }
+        for kind in DOC_COHERENCE_KINDS:
+            kind_margins = margins_by_kind.get(kind, [])
+            kind_count = counts_by_kind.get(kind, 0)
+            out[f"doc_coherence_{kind}_count"] = float(kind_count)
+            out[f"doc_coherence_{kind}_win_rate"] = (
+                wins_by_kind.get(kind, 0) / kind_count
+                if kind_count
+                else float("nan")
+            )
+            out[f"doc_coherence_{kind}_margin_bpb_mean"] = (
+                mean(kind_margins) if kind_margins else float("nan")
+            )
+            out[f"doc_coherence_{kind}_margin_bpb_median"] = (
+                median(kind_margins) if kind_margins else float("nan")
+            )
+            out[f"doc_coherence_{kind}_margin_bpb_min"] = (
+                min(kind_margins) if kind_margins else float("nan")
+            )
+        return out
+
+
+def empty_order_metrics(sentence_count: int = 0) -> dict[str, float]:
+    return {
+        "order_sentence_count": float(sentence_count),
+        "order_pair_count": 0.0,
+        "order_contrast_acc": float("nan"),
+        "order_contrast_margin_bpb_mean": float("nan"),
+        "order_contrast_margin_bpb_median": float("nan"),
+        "order_context_gain_bpb_mean": float("nan"),
+        "order_distractor_gain_bpb_mean": float("nan"),
+        "order_shuffle_pair_count": 0.0,
+        "order_shuffle_acc": float("nan"),
+        "order_shuffle_margin_bpb_mean": float("nan"),
+        "order_shuffle_margin_bpb_median": float("nan"),
+        "order_shuffle_actual_gain_bpb_mean": float("nan"),
+        "order_shuffle_distractor_gain_bpb_mean": float("nan"),
+    }
+
+
+def empty_document_coherence_metrics(sentence_count: int = 0) -> dict[str, float]:
+    out = {
+        "doc_coherence_sentence_count": float(sentence_count),
+        "doc_coherence_corruption_count": 0.0,
+        "doc_coherence_original_bpb": float("nan"),
+        "doc_coherence_win_rate": float("nan"),
+        "doc_coherence_margin_bpb_mean": float("nan"),
+        "doc_coherence_margin_bpb_median": float("nan"),
+        "doc_coherence_margin_bpb_min": float("nan"),
+    }
+    for kind in DOC_COHERENCE_KINDS:
+        out[f"doc_coherence_{kind}_count"] = 0.0
+        out[f"doc_coherence_{kind}_win_rate"] = float("nan")
+        out[f"doc_coherence_{kind}_margin_bpb_mean"] = float("nan")
+        out[f"doc_coherence_{kind}_margin_bpb_median"] = float("nan")
+        out[f"doc_coherence_{kind}_margin_bpb_min"] = float("nan")
+    return out
+
+def iter_samples(
+    manifest_path: Path,
+    limit_per_sample_set: int,
+) -> Iterable[dict[str, str]]:
+    data = load_sample_manifest(manifest_path)
+    root = manifest_path.parent
+    for sample_set in data["sample_sets"]:
+        source = root / sample_set["sample_path"]
+        payload = json.loads(source.read_text())
+        items = normalize_payload(payload)
+        if limit_per_sample_set > 0:
+            items = items[:limit_per_sample_set]
+        for i, item in enumerate(items):
+            yield normalize_sample(sample_set, item, i)
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    keys: list[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("sample_manifest_json")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--reference_models", default="")
+    parser.add_argument("--pinned_reference_model", default="")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device_map",
+        default="",
+        help="Optional Hugging Face device_map, e.g. 'auto', for sharded reference-model scoring.",
+    )
+    parser.add_argument("--dtype", default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"])
+    parser.add_argument("--max_eval_tokens", type=int, default=4096)
+    parser.add_argument("--score_batch_size", type=int, default=4)
+    parser.add_argument("--limit_samples_per_set", type=int, default=0)
+    parser.add_argument("--no_trust_remote_code", action="store_true")
+    parser.add_argument("--fineweb_dataset", default="HuggingFaceFW/fineweb")
+    parser.add_argument("--fineweb_config", default="sample-10BT")
+    parser.add_argument("--pinned_fineweb", default="9bb295ddab0e05d785b879661af7260fed5140fc")
+    parser.add_argument(
+        "--allow_fineweb_fallback",
+        action="store_true",
+        help="Use small built-in real-text controls if FineWeb cannot be loaded. Intended for local smoke tests only.",
+    )
+    parser.add_argument(
+        "--order_contrast",
+        action="store_true",
+        help="Score sentence-order contextual contrast for each sample with each reference LM.",
+    )
+    parser.add_argument("--order_contrast_pairs_per_sample", type=int, default=8)
+    parser.add_argument("--order_contrast_distractors", type=int, default=4)
+    parser.add_argument("--order_contrast_context_sentences", type=int, default=3)
+    parser.add_argument("--order_contrast_min_sentence_tokens", type=int, default=5)
+    parser.add_argument("--order_contrast_max_sentence_tokens", type=int, default=80)
+    parser.add_argument(
+        "--order_contrast_distractor_source",
+        choices=("generated_samples", "fineweb_controls", "generated_samples_plus_fineweb_controls"),
+        default="generated_samples",
+        help=(
+            "Sentence source for external order-contrast distractors. "
+            "Use fineweb_controls for release/crossing runs so scores do not depend on which generated samples are bundled together."
+        ),
+    )
+    parser.add_argument("--order_contrast_distractor_fineweb_count", type=int, default=128)
+    parser.add_argument(
+        "--document_coherence",
+        action="store_true",
+        help="Score original documents against corrupted sentence-order/replacement variants.",
+    )
+    parser.add_argument("--doc_coherence_min_sentences", type=int, default=5)
+    parser.add_argument("--doc_coherence_max_sentences", type=int, default=12)
+    parser.add_argument("--doc_coherence_max_sentence_tokens", type=int, default=80)
+    parser.add_argument("--doc_coherence_shuffles", type=int, default=1)
+    parser.add_argument("--doc_coherence_swaps", type=int, default=1)
+    parser.add_argument("--doc_coherence_replacements", type=int, default=1)
+    parser.add_argument("--doc_coherence_block_replacements", type=int, default=1)
+    parser.add_argument("--doc_coherence_tail_splices", type=int, default=1)
+    parser.add_argument("--doc_coherence_replacement_sentences", type=int, default=2)
+    parser.add_argument("--doc_coherence_block_sentences", type=int, default=3)
+    args = parser.parse_args()
+
+    total_start = time.perf_counter()
+    manifest_path = Path(args.sample_manifest_json)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = load_sample_manifest(manifest_path)
+    evaluation = manifest.get("evaluation", {})
+    if evaluation.get("seed_protocol") != SEED_PROTOCOL:
+        raise ValueError(f"Sample manifest must use {SEED_PROTOCOL}")
+    fixed_seeds = evaluation.get("seeds")
+    checkpoint_sha256 = evaluation.get("checkpoint_sha256")
+    if not isinstance(checkpoint_sha256, str) or fixed_seeds != checkpoint_evaluation_seeds(checkpoint_sha256):
+        raise ValueError(f"Sample-manifest seeds were not derived from its checkpoint hash: {manifest_path}")
+    required_seed_names = {"order_contrast", "fineweb_controls", "document_coherence"}
+    if not isinstance(fixed_seeds, dict) or not required_seed_names <= fixed_seeds.keys():
+        raise ValueError(f"Sample manifest is missing checkpoint-derived evaluation seeds: {manifest_path}")
+    order_contrast_seed = int(fixed_seeds["order_contrast"])
+    fineweb_controls_seed = int(fixed_seeds["fineweb_controls"])
+    document_coherence_seed = int(fixed_seeds["document_coherence"])
+
+    stage_start = time.perf_counter()
+    base_samples = list(iter_samples(manifest_path, args.limit_samples_per_set))
+    timing("load_generated_samples", time.perf_counter() - stage_start, samples=len(base_samples))
+    sentence_cache: list[list[str]] = []
+    candidate_pool: list[tuple[int, str]] = []
+    candidate_docs: list[tuple[int, list[str]]] = []
+    if args.order_contrast or args.document_coherence:
+        stage_start = time.perf_counter()
+        use_generated_distractors = args.order_contrast_distractor_source in {
+            "generated_samples",
+            "generated_samples_plus_fineweb_controls",
+        }
+        for sample_index, sample in enumerate(base_samples):
+            sentences = split_sentences(sample["target_text"])
+            sentence_cache.append(sentences)
+            if use_generated_distractors:
+                candidate_docs.append((sample_index, sentences))
+            if use_generated_distractors:
+                for sentence in sentences:
+                    candidate_pool.append((sample_index, sentence))
+        if args.order_contrast_distractor_source in {"fineweb_controls", "generated_samples_plus_fineweb_controls"}:
+            control_start = time.perf_counter()
+            distractor_samples = load_fineweb_controls(
+                count=args.order_contrast_distractor_fineweb_count,
+                seed=fineweb_controls_seed,
+                dataset_name=args.fineweb_dataset,
+                dataset_config=args.fineweb_config,
+                pinned_fineweb=args.pinned_fineweb,
+                allow_fallback=args.allow_fineweb_fallback,
+            )
+            timing(
+                "load_fineweb_controls",
+                time.perf_counter() - control_start,
+                controls=len(distractor_samples),
+                source=args.order_contrast_distractor_source,
+            )
+            base_offset = len(base_samples)
+            for distractor_index, sample in enumerate(distractor_samples):
+                sentences = split_sentences(sample["target_text"])
+                candidate_docs.append((base_offset + distractor_index, sentences))
+                for sentence in sentences:
+                    candidate_pool.append((base_offset + distractor_index, sentence))
+        print(
+            "Prepared sentence-order contrast pool: "
+            f"{len(candidate_pool)} sentences from {args.order_contrast_distractor_source}",
+            flush=True,
+        )
+        timing(
+            "prepare_sentence_pool",
+            time.perf_counter() - stage_start,
+            sentences=len(candidate_pool),
+            docs=len(candidate_docs),
+        )
+    stage_start = time.perf_counter()
+    deterministic_rows: list[dict[str, Any]] = []
+    for sample in base_samples:
+        row: dict[str, Any] = {
+            key: value
+            for key, value in sample.items()
+            if key not in {"prompt", "target_text", "full_text"}
+        }
+        row["reference_model"] = "deterministic"
+        row.update(deterministic_metrics(sample["target_text"]))
+        deterministic_rows.append(row)
+    timing("deterministic_metrics", time.perf_counter() - stage_start, samples=len(base_samples))
+
+    all_rows = list(deterministic_rows)
+    models = [model.strip() for model in args.reference_models.split(",") if model.strip()]
+    for model_name in models:
+        print(f"Loading reference LM: {model_name}", flush=True)
+        model_load_start = time.perf_counter()
+        scorer = ReferenceLMScorer(
+            model_name,
+            device=args.device,
+            dtype=args.dtype,
+            max_eval_tokens=args.max_eval_tokens,
+            score_batch_size=args.score_batch_size,
+            trust_remote_code=not args.no_trust_remote_code,
+            device_map=args.device_map,
+            pinned_reference_model=args.pinned_reference_model,
+        )
+        print(f"Loaded {model_name}", flush=True)
+        timing("reference_model_load", time.perf_counter() - model_load_start, model=model_name)
+        model_score_start = time.perf_counter()
+        ref_score_seconds = 0.0
+        order_seconds = 0.0
+        doc_seconds = 0.0
+        for i, sample in enumerate(base_samples, start=1):
+            row = {
+                key: value
+                for key, value in sample.items()
+                if key not in {"prompt", "target_text", "full_text"}
+            }
+            row["reference_model"] = model_name
+            row.update(deterministic_metrics(sample["target_text"]))
+            section_start = time.perf_counter()
+            row.update(scorer.score(sample["prompt"], sample["target_text"]))
+            ref_score_seconds += time.perf_counter() - section_start
+            if args.order_contrast:
+                section_start = time.perf_counter()
+                row.update(
+                    scorer.score_order_contrast(
+                        sample=sample,
+                        sample_index=i - 1,
+                        sentence_cache=sentence_cache,
+                        candidate_pool=candidate_pool,
+                        pairs_per_sample=args.order_contrast_pairs_per_sample,
+                        distractors=args.order_contrast_distractors,
+                        context_sentences=args.order_contrast_context_sentences,
+                        min_sentence_tokens=args.order_contrast_min_sentence_tokens,
+                        max_sentence_tokens=args.order_contrast_max_sentence_tokens,
+                        seed=order_contrast_seed,
+                    )
+                )
+                order_seconds += time.perf_counter() - section_start
+            if args.document_coherence:
+                section_start = time.perf_counter()
+                row.update(
+                    scorer.score_document_coherence(
+                        sample=sample,
+                        sample_index=i - 1,
+                        sentence_cache=sentence_cache,
+                        candidate_docs=candidate_docs,
+                        min_sentences=args.doc_coherence_min_sentences,
+                        max_sentences=args.doc_coherence_max_sentences,
+                        max_sentence_tokens=args.doc_coherence_max_sentence_tokens,
+                        shuffles=args.doc_coherence_shuffles,
+                        swaps=args.doc_coherence_swaps,
+                        replacements=args.doc_coherence_replacements,
+                        block_replacements=args.doc_coherence_block_replacements,
+                        tail_splices=args.doc_coherence_tail_splices,
+                        replacement_sentences=args.doc_coherence_replacement_sentences,
+                        block_sentences=args.doc_coherence_block_sentences,
+                        seed=document_coherence_seed,
+                    )
+                )
+                doc_seconds += time.perf_counter() - section_start
+            all_rows.append(row)
+            if i % 25 == 0:
+                elapsed = time.perf_counter() - model_score_start
+                print(f"Scored {i}/{len(base_samples)} samples with {model_name}", flush=True)
+                timing(
+                    "reference_model_score_progress",
+                    elapsed,
+                    model=model_name,
+                    samples=i,
+                    total=len(base_samples),
+                    avg_sample_seconds=f"{elapsed / i:.3f}",
+                )
+        timing("reference_model_ref_bpb", ref_score_seconds, model=model_name)
+        timing("reference_model_order_contrast", order_seconds, model=model_name)
+        timing("reference_model_document_coherence", doc_seconds, model=model_name)
+        timing("reference_model_score_total", time.perf_counter() - model_score_start, model=model_name)
+    stage_start = time.perf_counter()
+    write_csv(output_dir / "sample_scores.csv", all_rows)
+    (output_dir / "README.md").write_text(
+        "# Generation Quality Scores\n\n"
+        f"- samples scored: `{len(base_samples)}`\n"
+        f"- reference models: `{', '.join(models) if models else 'deterministic only'}`\n"
+        f"- sample scores: `sample_scores.csv`\n"
+    )
+    timing("write_outputs", time.perf_counter() - stage_start, rows=len(all_rows))
+    print(f"Wrote {output_dir / 'sample_scores.csv'}")
+    print(f"Wrote {output_dir / 'README.md'}")
+    timing("total", time.perf_counter() - total_start)
+
+
+if __name__ == "__main__":
+    main()
+
+
 ===== speedrun_dlm/score_generation_quality.py =====
 import argparse
 import csv
+import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 import time
@@ -3827,6 +5608,15 @@ from typing import Any
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent
+SEED_PROTOCOL = "checkpoint-sha256-v1"
+SEED_PURPOSES = (
+    "sampling",
+    "inference_cost",
+    "order_contrast",
+    "fineweb_controls",
+    "document_coherence",
+)
+EVAL_SEED_MODULUS = 2**63
 
 # Release gate settings passed through to _quality_metrics.
 ORDER_CONTRAST = {
@@ -3835,9 +5625,7 @@ ORDER_CONTRAST = {
     "context_sentences": 3,
     "min_sentence_tokens": 5,
     "max_sentence_tokens": 80,
-    "seed": 1337,
     "distractor_fineweb_count": 128,
-    "distractor_seed": 4242,
 }
 DOCUMENT_COHERENCE = {
     "min_sentences": 5,
@@ -3850,7 +5638,6 @@ DOCUMENT_COHERENCE = {
     "tail_splices": 1,
     "replacement_sentences": 2,
     "block_sentences": 3,
-    "seed": 2027,
 }
 
 UNCONDITIONAL_PRESET: dict[str, float] = {
@@ -3865,6 +5652,145 @@ UNCONDITIONAL_PRESET: dict[str, float] = {
     "max_mask": 0,
     "max_bad": 0,
 }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def derive_evaluation_seed(checkpoint_sha256: str, purpose: str) -> int:
+    if purpose not in SEED_PURPOSES:
+        raise ValueError(f"Unknown evaluation seed purpose: {purpose!r}")
+    payload = f"{SEED_PROTOCOL}\0{checkpoint_sha256}\0{purpose}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % EVAL_SEED_MODULUS
+
+
+def checkpoint_evaluation_seeds(checkpoint_sha256: str) -> dict[str, int]:
+    return {purpose: derive_evaluation_seed(checkpoint_sha256, purpose) for purpose in SEED_PURPOSES}
+
+
+def load_verified_sample_manifest(
+    manifest_path: Path,
+    checkpoint_sha256: str,
+    official_sampling_batch_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a sample manifest and verify its checkpoint-derived evaluation metadata."""
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("version") != 1:
+        raise ValueError(f"Unsupported sample-manifest version in {manifest_path}")
+
+    evaluation = manifest.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError(f"Missing evaluation metadata in {manifest_path}")
+    if evaluation.get("seed_protocol") != SEED_PROTOCOL:
+        raise ValueError(f"{manifest_path} does not use {SEED_PROTOCOL}")
+    if evaluation.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(f"Checkpoint hash does not match {manifest_path}")
+
+    expected_seeds = checkpoint_evaluation_seeds(checkpoint_sha256)
+    if evaluation.get("seeds") != expected_seeds:
+        raise ValueError(f"Evaluation seeds were not derived from the checkpoint in {manifest_path}")
+    if int(evaluation.get("sampling_batch_size", -1)) != official_sampling_batch_size:
+        raise ValueError(
+            f"{manifest_path} must use official sampling batch size {official_sampling_batch_size}"
+        )
+
+    sample_sets = manifest.get("sample_sets")
+    if not isinstance(sample_sets, list) or len(sample_sets) != 1:
+        raise ValueError(f"{manifest_path} must contain exactly one sample set")
+    sample_path = manifest_path.parent / str(sample_sets[0].get("sample_path", ""))
+    if not sample_path.is_file():
+        raise FileNotFoundError(f"Sample file referenced by {manifest_path} is unavailable: {sample_path}")
+    if sample_sets[0].get("sample_sha256") != sha256_file(sample_path):
+        raise ValueError(f"Generated-sample hash does not match {manifest_path}")
+    sample_payload = json.loads(sample_path.read_text())
+    try:
+        training_seed = int(evaluation["training_seed"])
+        sample_training_seed = int(sample_payload["training_seed"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Missing integer training seed in {manifest_path} or {sample_path}") from exc
+    if sample_training_seed != training_seed:
+        raise ValueError(f"Training seed mismatch between {manifest_path} and {sample_path}")
+
+    sample_rows = sample_payload.get("samples")
+    if not isinstance(sample_rows, list) or not sample_rows:
+        raise ValueError(f"Missing samples in {sample_path}")
+    trainer = sample_payload.get("trainer")
+    if trainer not in {"ar", "dlm"}:
+        raise ValueError(f"Unsupported trainer in {sample_path}: {trainer!r}")
+    for index, row in enumerate(sample_rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Sample {index} in {sample_path} is not an object")
+        if int(row.get("sample_index", -1)) != index:
+            raise ValueError(f"Sample indices are missing, duplicated, or reordered in {sample_path}")
+        if trainer == "dlm":
+            batch_start = (index // official_sampling_batch_size) * official_sampling_batch_size
+            expected_seed = expected_seeds["sampling"] + batch_start
+            expected_batch_size = min(official_sampling_batch_size, len(sample_rows) - batch_start)
+        else:
+            expected_seed = expected_seeds["sampling"] + index
+            expected_batch_size = 1
+        if int(row.get("seed", -1)) != expected_seed:
+            raise ValueError(f"Sample {index} does not record its actual checkpoint-derived RNG seed")
+        if int(row.get("sampling_batch_size", -1)) != expected_batch_size:
+            raise ValueError(f"Sample {index} does not use the official sampling batch size")
+    return manifest, sample_payload
+
+
+def materialize_reused_samples(source_manifest: Path, output_dir: Path) -> Path:
+    """Copy reused generated samples so the new scorer output remains self-contained."""
+    manifest = json.loads(source_manifest.read_text())
+    sample_sets = manifest.get("sample_sets")
+    if not isinstance(sample_sets, list) or len(sample_sets) != 1:
+        raise ValueError(f"{source_manifest} must contain exactly one sample set")
+    relative_sample_path = Path(str(sample_sets[0].get("sample_path", "")))
+    if relative_sample_path.is_absolute() or ".." in relative_sample_path.parts:
+        raise ValueError(f"Sample path in {source_manifest} must stay inside its scorer output directory")
+    source_sample = source_manifest.parent / relative_sample_path
+    destination_sample = output_dir / relative_sample_path
+    destination_sample.parent.mkdir(parents=True, exist_ok=True)
+    if source_sample.resolve() != destination_sample.resolve():
+        shutil.copyfile(source_sample, destination_sample)
+
+    destination_manifest = output_dir / "sample_manifest.json"
+    if source_manifest.resolve() != destination_manifest.resolve():
+        shutil.copyfile(source_manifest, destination_manifest)
+    source_markdown = source_manifest.parent / "samples.md"
+    destination_markdown = output_dir / "samples.md"
+    if source_markdown.is_file() and source_markdown.resolve() != destination_markdown.resolve():
+        shutil.copyfile(source_markdown, destination_markdown)
+    return destination_manifest
+
+
+def record_scoring_provenance(
+    manifest_path: Path,
+    rule_path: Path,
+    rule: dict[str, Any],
+    reference_model: str,
+    pinned_reference_model: str,
+    args: argparse.Namespace,
+) -> None:
+    """Bind the generated samples to the exact official scoring configuration and outputs."""
+    manifest = json.loads(manifest_path.read_text())
+    output_dir = manifest_path.parent
+    manifest["scoring"] = {
+        "rule_version": rule["version"],
+        "rule_sha256": sha256_file(rule_path),
+        "reference_model": reference_model,
+        "pinned_reference_model": pinned_reference_model,
+        "dtype": args.dtype,
+        "max_eval_tokens": args.max_eval_tokens,
+        "score_batch_size": args.score_batch_size,
+        "reference_device_map": args.reference_device_map,
+        "allow_fineweb_fallback": bool(args.allow_fineweb_fallback),
+        "sample_scores_sha256": sha256_file(output_dir / "scores" / "sample_scores.csv"),
+        "sample_outcomes_sha256": sha256_file(output_dir / "sample_outcomes.csv"),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def as_float(value: Any) -> float:
@@ -3898,13 +5824,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def binom_tail_ge(n: int, x: int, p0: float) -> float:
-    total = 0.0
-    for k in range(x, n + 1):
-        total += math.comb(n, k) * (p0**k) * ((1.0 - p0) ** (n - k))
-    return min(1.0, max(0.0, total))
 
 
 def deterministic_pass(row: dict[str, str], rule: dict[str, Any]) -> bool:
@@ -3973,14 +5892,15 @@ def run_command(command: list[str], cwd: Path, stage: str) -> float:
     return elapsed
 
 
-def generate_panel(
+def generate_sample_manifest(
     checkpoint_path: str,
+    checkpoint_sha256: str,
+    evaluation_seeds: dict[str, int],
     output_dir: Path,
     tokens: int,
     samples: int,
     temperature: float,
     top_k: int,
-    seed: int,
     dlm_sampler: str,
     checkpoint_variant: str,
     amp_dtype: str,
@@ -3989,7 +5909,7 @@ def generate_panel(
     sampling_batch_size: int,
 ) -> Path:
     if not checkpoint_path:
-        raise ValueError("Pass a checkpoint path, or provide --panel_json to score existing samples.")
+        raise ValueError("Pass the checkpoint whose contents determine evaluation randomness.")
     checkpoint = Path(checkpoint_path).resolve()
     checkpoint_label = checkpoint.name or checkpoint_path
     samples_dir = output_dir / "samples"
@@ -4009,7 +5929,7 @@ def generate_panel(
         "--top_k",
         str(top_k),
         "--seed",
-        str(seed),
+        str(evaluation_seeds["sampling"]),
         "--dlm_sampler",
         dlm_sampler,
         "--checkpoint_variant",
@@ -4028,18 +5948,31 @@ def generate_panel(
         str(output_dir / "samples.md"),
     ]
     sample_seconds = run_command(command, REPO_ROOT, "sample_text")
-    panel_json = output_dir / "panel.json"
-    panel_json.write_text(
+    sample_payload = json.loads(sample_json.read_text())
+    training_seed = sample_payload.get("training_seed")
+    if training_seed is None:
+        raise ValueError(f"Checkpoint {checkpoint} does not record its training seed")
+    manifest_path = output_dir / "sample_manifest.json"
+    manifest_path.write_text(
         json.dumps(
             {
                 "version": 1,
-                "description": "Generation-quality gate panel generated from a checkpoint.",
-                "panels": [
+                "description": "Generated samples and checkpoint evaluation metadata.",
+                "evaluation": {
+                    "seed_protocol": SEED_PROTOCOL,
+                    "checkpoint_path": str(checkpoint),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "training_seed": training_seed,
+                    "sampling_batch_size": sampling_batch_size,
+                    "seeds": evaluation_seeds,
+                },
+                "sample_sets": [
                     {
                         "name": "checkpoint_unconditional",
                         "family": "candidate",
                         "protocol": "unconditional",
                         "sample_path": str(sample_json.relative_to(output_dir)),
+                        "sample_sha256": sha256_file(sample_json),
                         "source_path": checkpoint_label,
                         "subjective_tier": None,
                         "gate_label": "candidate_pass",
@@ -4050,14 +5983,15 @@ def generate_panel(
         )
         + "\n"
     )
-    timing("generate_panel_total", sample_seconds)
-    return panel_json
+    timing("generate_samples_total", sample_seconds)
+    return manifest_path
 
 
-def score_panel(
-    panel_json: Path,
+def score_generated_samples(
+    manifest_path: Path,
     output_dir: Path,
     reference_model: str,
+    pinned_reference_model: str,
     dtype: str,
     max_eval_tokens: int,
     score_batch_size: int,
@@ -4068,11 +6002,12 @@ def score_panel(
         sys.executable,
         "-m",
         "speedrun_dlm._quality_metrics",
-        str(panel_json),
+        str(manifest_path),
         "--output_dir",
         str(output_dir / "scores"),
         "--reference_models",
         reference_model,
+        *(["--pinned_reference_model", pinned_reference_model] if pinned_reference_model else []),
         "--dtype",
         dtype,
         "--max_eval_tokens",
@@ -4091,14 +6026,10 @@ def score_panel(
         str(ORDER_CONTRAST["min_sentence_tokens"]),
         "--order_contrast_max_sentence_tokens",
         str(ORDER_CONTRAST["max_sentence_tokens"]),
-        "--order_contrast_seed",
-        str(ORDER_CONTRAST["seed"]),
         "--order_contrast_distractor_source",
         "fineweb_controls",
         "--order_contrast_distractor_fineweb_count",
         str(ORDER_CONTRAST["distractor_fineweb_count"]),
-        "--order_contrast_distractor_seed",
-        str(ORDER_CONTRAST["distractor_seed"]),
         "--document_coherence",
         "--doc_coherence_min_sentences",
         str(DOCUMENT_COHERENCE["min_sentences"]),
@@ -4120,8 +6051,6 @@ def score_panel(
         str(DOCUMENT_COHERENCE["replacement_sentences"]),
         "--doc_coherence_block_sentences",
         str(DOCUMENT_COHERENCE["block_sentences"]),
-        "--doc_coherence_seed",
-        str(DOCUMENT_COHERENCE["seed"]),
     ]
     if allow_fineweb_fallback:
         command.append("--allow_fineweb_fallback")
@@ -4129,16 +6058,14 @@ def score_panel(
     return output_dir / "scores" / "sample_scores.csv"
 
 
-def summarize_scores(
+def write_sample_outcomes(
     sample_scores: Path,
     output_dir: Path,
     rule: dict[str, Any],
     reference_model: str,
-    require_significance: bool,
-    sample_seed: int | None,
-    temperature: float | None,
-    top_k: int | None,
-) -> tuple[bool, list[dict[str, Any]]]:
+    temperature: float,
+    top_k: int,
+) -> tuple[int, int, list[dict[str, Any]]]:
     rows = [
         row
         for row in read_csv(sample_scores)
@@ -4168,32 +6095,21 @@ def summarize_scores(
 
     total = len(rows)
     pass_rate = passed / total
-    threshold = float(rule["pass_rate_threshold"])
-    p_value = binom_tail_ge(total, passed, threshold)
-    significance_pass = not require_significance or p_value < float(rule["significance_p_value"])
-    overall_pass = pass_rate >= threshold and significance_pass
-    write_csv(output_dir / "sample_passes.csv", summaries)
+    write_csv(output_dir / "sample_outcomes.csv", summaries)
 
     lines = [
-        "# Quality Gate Result",
+        "# Checkpoint Sample Outcomes",
         "",
         f"- reference model: `{reference_model}`",
-        f"- sampling seed: `{sample_seed}`"
-        if sample_seed is not None
-        else "- sampling seed: `not applicable (precomputed panel)`",
-        f"- sampling temperature: `{temperature}`"
-        if temperature is not None
-        else "- sampling temperature: `not applicable (precomputed panel)`",
-        f"- sampling top_k: `{top_k}`"
-        if top_k is not None
-        else "- sampling top_k: `not applicable (precomputed panel)`",
+        f"- evaluation randomness: `checkpoint-derived ({SEED_PROTOCOL})`",
+        f"- sampling temperature: `{temperature}`",
+        f"- sampling top_k: `{top_k}`",
         f"- samples: `{total}`",
         f"- passing samples: `{passed}`",
         f"- pass rate: `{pass_rate:.4f}`",
-        f"- required pass rate: `{threshold:.4f}`",
-        f"- exact binomial p-value vs threshold: `{p_value:.6g}`",
-        f"- significance required: `{require_significance}`",
-        f"- overall pass: `{overall_pass}`",
+        "",
+        "This is a descriptive result for one checkpoint. The official quality-gate result is computed by "
+        "`records/make_record.py` after pooling the sample outcomes from all 50 training seeds.",
         "",
         "## Rule",
         "",
@@ -4213,22 +6129,28 @@ def summarize_scores(
         f"- bad characters: `bad_char_count <= {rule['max_bad_char_count']}`",
     ]
     (output_dir / "README.md").write_text("\n".join(lines) + "\n")
-    return overall_pass, summaries
+    return total, passed, summaries
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate unconditional samples from a checkpoint and apply the v0 quality gate.")
-    parser.add_argument("checkpoint", nargs="?", default="", help="Checkpoint to sample. Omit when using --panel_json.")
-    parser.add_argument("--panel_json", default="", help="Existing panel JSON to score instead of sampling a checkpoint.")
+    parser = argparse.ArgumentParser(
+        description="Generate unconditional samples from one checkpoint and record their quality outcomes."
+    )
+    parser.add_argument("checkpoint", help="Checkpoint whose contents determine all evaluation randomness.")
+    parser.add_argument(
+        "--reuse_samples_from",
+        default="",
+        metavar="OUTPUT_DIR",
+        help="Reuse generated samples from a previous scorer output directory for this exact checkpoint.",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--rule_json", default=str(REPO_ROOT / "generation_quality_rule.json"))
     parser.add_argument("--reference_model", default="")
-    parser.add_argument("--require_significance", action="store_true")
+    parser.add_argument("--pinned_reference_model", default="")
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--dlm_sampler",
         default="auto",
@@ -4238,12 +6160,6 @@ def main() -> None:
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
     parser.add_argument("--num_sampling_steps", type=int, default=1000)
     parser.add_argument("--sampling_eps", type=float, default=1e-5)
-    parser.add_argument(
-        "--sampling_batch_size",
-        type=int,
-        default=1,
-        help="Number of unconditional DLM samples to generate per batch; AR checkpoints ignore this.",
-    )
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--max_eval_tokens", type=int, default=4096)
     parser.add_argument("--score_batch_size", type=int, default=4)
@@ -4257,33 +6173,69 @@ def main() -> None:
 
     total_start = time.perf_counter()
     output_dir = Path(args.output_dir).resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError(f"Output directory must be new or empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    rule = json.loads(Path(args.rule_json).read_text())
+    rule_path = Path(args.rule_json).resolve()
+    rule = json.loads(rule_path.read_text())
+    official_sampling_batch_size = int(rule["official_sampling_batch_size"])
+    if official_sampling_batch_size < 1:
+        raise ValueError("official_sampling_batch_size must be positive")
     reference_model = args.reference_model or rule["candidate_reference_model"]
+    pinned_reference_model = args.pinned_reference_model or rule.get("pinned_reference_model", "")
 
-    panel_json = (
-        Path(args.panel_json).resolve()
-        if args.panel_json
-        else generate_panel(
+    checkpoint = Path(args.checkpoint).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    evaluation_seeds = checkpoint_evaluation_seeds(checkpoint_sha256)
+
+    if args.reuse_samples_from:
+        source_manifest = Path(args.reuse_samples_from).resolve() / "sample_manifest.json"
+        load_verified_sample_manifest(
+            source_manifest,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+        manifest_path = materialize_reused_samples(source_manifest, output_dir)
+        _, sample_payload = load_verified_sample_manifest(
+            manifest_path,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+    else:
+        manifest_path = generate_sample_manifest(
             args.checkpoint,
+            checkpoint_sha256,
+            evaluation_seeds,
             output_dir,
             args.tokens,
             args.samples,
             args.temperature,
             args.top_k,
-            args.seed,
             args.dlm_sampler,
             args.checkpoint_variant,
             args.amp_dtype,
             args.num_sampling_steps,
             args.sampling_eps,
-            args.sampling_batch_size,
+            official_sampling_batch_size,
         )
-    )
-    sample_scores = score_panel(
-        panel_json,
+        _, sample_payload = load_verified_sample_manifest(
+            manifest_path,
+            checkpoint_sha256,
+            official_sampling_batch_size,
+        )
+
+    sample_rows = sample_payload["samples"]
+    temperatures = {float(row["temperature"]) for row in sample_rows}
+    top_ks = {int(row["top_k"]) for row in sample_rows}
+    if len(temperatures) != 1 or len(top_ks) != 1:
+        raise ValueError(f"Samples in {manifest_path} do not use one sampling configuration")
+    sample_scores = score_generated_samples(
+        manifest_path,
         output_dir,
         reference_model,
+        pinned_reference_model,
         args.dtype,
         args.max_eval_tokens,
         args.score_batch_size,
@@ -4291,18 +6243,28 @@ def main() -> None:
         args.allow_fineweb_fallback,
     )
     summarize_start = time.perf_counter()
-    passed, _ = summarize_scores(
+    total_samples, passing_samples, _ = write_sample_outcomes(
         sample_scores,
         output_dir,
         rule,
         reference_model,
-        require_significance=args.require_significance,
-        sample_seed=None if args.panel_json else args.seed,
-        temperature=None if args.panel_json else args.temperature,
-        top_k=None if args.panel_json else args.top_k,
+        temperature=temperatures.pop(),
+        top_k=top_ks.pop(),
     )
-    timing("summarize_scores", time.perf_counter() - summarize_start)
-    print(f"QUALITY_GATE_RESULT pass={str(passed).lower()} report={output_dir / 'README.md'}", flush=True)
+    record_scoring_provenance(
+        manifest_path,
+        rule_path,
+        rule,
+        reference_model,
+        pinned_reference_model,
+        args,
+    )
+    timing("write_sample_outcomes", time.perf_counter() - summarize_start)
+    print(
+        f"QUALITY_SAMPLE_RESULT samples={total_samples} passing_samples={passing_samples} "
+        f"pass_rate={passing_samples / total_samples:.6f} report={output_dir / 'README.md'}",
+        flush=True,
+    )
     timing("total", time.perf_counter() - total_start)
 
 
@@ -4320,6 +6282,7 @@ from typing import Any
 import torch
 
 from .checkpoint_utils import load_snapshot, resolve_amp_dtype
+from .score_generation_quality import SEED_PROTOCOL, derive_evaluation_seed, sha256_file
 from .sample_text import (
     DLM_SAMPLER_CHOICES,
     checkpoint_objective_and_noise,
@@ -4329,6 +6292,13 @@ from .sample_text import (
 )
 
 
+ATTENTION_FLOP_EVENT_MARKERS = (
+    "scaled_dot_product",
+    "flash_attention",
+    "efficient_attention",
+    "aten::bmm",
+    "aten::baddbmm",
+)
 def checkpoint_label(path: str) -> str:
     return Path(path).name or path
 
@@ -4360,6 +6330,32 @@ def make_generator(device: str, seed: int) -> torch.Generator:
     generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
     generator.manual_seed(seed)
     return generator
+
+
+def causal_attention_pairs_over_generation(generated_tokens: int, context_length: int, prompt_tokens: int = 1) -> float:
+    total = 0.0
+    for step in range(generated_tokens):
+        seq_len = min(prompt_tokens + step, context_length)
+        total += seq_len * (seq_len + 1) / 2
+    return total
+
+
+def estimate_sdpa_flops_per_sample(snapshot, tokens: int, forward_calls_per_sample: float) -> float:
+    """Estimate QK^T and attention-value FLOPs missing from PyTorch SDPA profiler events."""
+    config = snapshot.model.config
+    layers = int(config.n_layer)
+    width = int(config.n_embd)
+    if snapshot.trainer == "ar":
+        pairs = causal_attention_pairs_over_generation(tokens, int(config.block_size))
+    elif snapshot.trainer == "dlm":
+        pairs = forward_calls_per_sample * tokens * tokens
+    else:
+        return 0.0
+    return float(layers * 4 * width * pairs)
+
+
+def is_attention_flop_event(key: str) -> bool:
+    return any(marker in key for marker in ATTENTION_FLOP_EVENT_MARKERS)
 
 
 def run_one_sample(
@@ -4422,7 +6418,7 @@ def profile_samples(
     dlm_sampler: str,
     num_sampling_steps: int,
     sampling_eps: float,
-) -> tuple[int, float, int]:
+) -> tuple[int, int, float, int]:
     with ForwardCounter(snapshot.model) as counter:
         cuda_sync(device)
         start = time.perf_counter()
@@ -4448,8 +6444,12 @@ def profile_samples(
                 )
         cuda_sync(device)
         elapsed = time.perf_counter() - start
-    flops = int(sum(getattr(event, "flops", 0) or 0 for event in prof.key_averages()))
-    return flops, elapsed, counter.calls
+    events = prof.key_averages()
+    flops = int(sum(getattr(event, "flops", 0) or 0 for event in events))
+    attention_flops = int(
+        sum((getattr(event, "flops", 0) or 0) for event in events if is_attention_flop_event(event.key))
+    )
+    return flops, attention_flops, elapsed, counter.calls
 
 
 def write_markdown(payload: dict[str, Any], path: Path) -> None:
@@ -4463,23 +6463,32 @@ def write_markdown(payload: dict[str, Any], path: Path) -> None:
         f"- generated tokens per sample: `{payload['tokens_per_sample']}`",
         f"- measured samples: `{payload['measured_samples']}`",
         f"- warmup samples: `{payload['warmup_samples']}`",
+        f"- RNG seed protocol: `{payload['seed_protocol']}`",
+        f"- RNG seed: `{payload['seed']}`",
         f"- temperature: `{payload['temperature']}`",
         f"- top_k: `{payload['top_k']}`",
         f"- DLM sampler: `{payload['dlm_sampler']}`",
         f"- DLM sampling steps: `{payload['dlm_sampling_steps']}`",
         f"- DLM sampling eps: `{payload['sampling_eps']}`",
         f"- forward calls per sample: `{payload['forward_calls_per_sample']:.6g}`",
-        f"- profiler FLOPs per sample: `{payload['profiler_flops_per_sample']:.6g}`",
-        f"- profiler TFLOPs per sample: `{payload['profiler_tflops_per_sample']:.6g}`",
-        f"- profiler FLOPs per 128-sample gate: `{payload['profiler_flops_per_128_sample_gate']:.6g}`",
-        f"- profiler FLOPs per 1024 samples: `{payload['profiler_flops_per_1024_samples']:.6g}`",
+        f"- PyTorch profiler FLOPs per sample: `{payload['profiler_flops_per_sample']:.6g}`",
+        f"- attention FLOPs already measured by PyTorch: `{payload['attention_flops_measured_by_torch_per_sample']:.6g}`",
+        f"- attention FLOPs from formula: `{payload['attention_flops_by_formula_per_sample']:.6g}`",
+        f"- attention FLOPs added by formula: `{payload['attention_flops_added_by_formula_per_sample']:.6g}`",
+        f"- total FLOPs per sample: `{payload['total_flops_per_sample']:.6g}`",
+        f"- PyTorch profiler TFLOPs per sample: `{payload['profiler_tflops_per_sample']:.6g}`",
+        f"- total TFLOPs per sample: `{payload['total_tflops_per_sample']:.6g}`",
+        f"- PyTorch profiler FLOPs per 128-sample gate: `{payload['profiler_flops_per_128_sample_gate']:.6g}`",
+        f"- total FLOPs per 128-sample gate: `{payload['total_flops_per_128_sample_gate']:.6g}`",
+        f"- PyTorch profiler FLOPs per 1024 samples: `{payload['profiler_flops_per_1024_samples']:.6g}`",
+        f"- total FLOPs per 1024 samples: `{payload['total_flops_per_1024_samples']:.6g}`",
         f"- wall seconds per sample: `{payload['wall_seconds_per_sample']:.6g}`",
         f"- CUDA max memory MiB: `{payload['cuda_max_memory_mib']:.1f}`",
         "",
         "## Notes",
         "",
-        "- FLOPs are estimated by `torch.profiler.profile(with_flops=True)` on the actual sampler path.",
-        "- The profiler only counts operators for which PyTorch reports FLOPs; keep the JSON artifact with every record.",
+        "- PyTorch FLOPs are measured with `torch.profiler.profile(with_flops=True)` while running the sampling code.",
+        "- Attention FLOPs are added by formula only for the part not already counted by PyTorch.",
         "- Warmup samples run before profiling and are not included in the reported FLOPs or wall time.",
     ]
     path.write_text("\n".join(lines) + "\n")
@@ -4493,7 +6502,6 @@ def main() -> None:
     parser.add_argument("--warmup_samples", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint_variant", choices=("auto", "model", "ema_model"), default="model")
     parser.add_argument("--amp_dtype", choices=("auto", "none", "bfloat16"), default="auto")
@@ -4504,6 +6512,11 @@ def main() -> None:
     parser.add_argument("--output_md", default="")
     args = parser.parse_args()
 
+    checkpoint = Path(args.snapshot_path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    checkpoint_sha256 = sha256_file(checkpoint)
+    evaluation_seed = derive_evaluation_seed(checkpoint_sha256, "inference_cost")
     device = args.device
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
     snapshot = load_snapshot(args.snapshot_path, device=device, checkpoint_variant=args.checkpoint_variant)
@@ -4527,18 +6540,18 @@ def main() -> None:
             top_k=args.top_k,
             device=device,
             amp_dtype=amp_dtype,
-            seed=args.seed - args.warmup_samples + offset,
+            seed=evaluation_seed - args.warmup_samples + offset,
             dlm_sampler=args.dlm_sampler,
             num_sampling_steps=args.num_sampling_steps,
             sampling_eps=args.sampling_eps,
         )
     cuda_sync(device)
 
-    flops, elapsed, forward_calls = profile_samples(
+    flops, measured_attention_flops, elapsed, forward_calls = profile_samples(
         snapshot,
         tokens=args.tokens,
         measured_samples=args.measured_samples,
-        seed=args.seed,
+        seed=evaluation_seed,
         temperature=args.temperature,
         top_k=args.top_k,
         device=device,
@@ -4550,8 +6563,19 @@ def main() -> None:
 
     per_sample_flops = flops / max(args.measured_samples, 1)
     per_sample_calls = forward_calls / max(args.measured_samples, 1)
+    measured_attention_flops_per_sample = measured_attention_flops / max(args.measured_samples, 1)
+    attention_flops_by_formula_per_sample = estimate_sdpa_flops_per_sample(snapshot, args.tokens, per_sample_calls)
+    attention_flops_added_by_formula_per_sample = max(
+        attention_flops_by_formula_per_sample - measured_attention_flops_per_sample,
+        0.0,
+    )
+    total_flops_per_sample = per_sample_flops + attention_flops_added_by_formula_per_sample
     payload: dict[str, Any] = {
         "snapshot": checkpoint_label(args.snapshot_path),
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "seed_protocol": SEED_PROTOCOL,
+        "training_seed": snapshot.args.get("seed"),
         "trainer": snapshot.trainer,
         "checkpoint_variant": snapshot.checkpoint_variant,
         "num_parameters": int(num_parameters),
@@ -4561,7 +6585,7 @@ def main() -> None:
         "tokens_per_sample": args.tokens,
         "measured_samples": args.measured_samples,
         "warmup_samples": args.warmup_samples,
-        "seed": args.seed,
+        "seed": evaluation_seed,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "dlm_sampler": reported_dlm_sampler,
@@ -4574,16 +6598,53 @@ def main() -> None:
         "profiler_flops_per_1024_token_sample": per_sample_flops if args.tokens == 1024 else None,
         "profiler_tflops_per_sample": per_sample_flops / 1e12,
         "profiler_tflops_per_1024_token_sample": per_sample_flops / 1e12 if args.tokens == 1024 else None,
+        "attention_flops_measured_by_torch_per_sample": measured_attention_flops_per_sample,
+        "attention_flops_measured_by_torch_per_1024_token_sample": (
+            measured_attention_flops_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_measured_by_torch_per_sample": measured_attention_flops_per_sample / 1e12,
+        "attention_tflops_measured_by_torch_per_1024_token_sample": (
+            measured_attention_flops_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "attention_flops_by_formula_per_sample": attention_flops_by_formula_per_sample,
+        "attention_flops_by_formula_per_1024_token_sample": (
+            attention_flops_by_formula_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_by_formula_per_sample": attention_flops_by_formula_per_sample / 1e12,
+        "attention_tflops_by_formula_per_1024_token_sample": (
+            attention_flops_by_formula_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "attention_flops_added_by_formula_per_sample": attention_flops_added_by_formula_per_sample,
+        "attention_flops_added_by_formula_per_1024_token_sample": (
+            attention_flops_added_by_formula_per_sample if args.tokens == 1024 else None
+        ),
+        "attention_tflops_added_by_formula_per_sample": attention_flops_added_by_formula_per_sample / 1e12,
+        "attention_tflops_added_by_formula_per_1024_token_sample": (
+            attention_flops_added_by_formula_per_sample / 1e12 if args.tokens == 1024 else None
+        ),
+        "total_flops_per_sample": total_flops_per_sample,
+        "total_flops_per_1024_token_sample": total_flops_per_sample if args.tokens == 1024 else None,
+        "total_tflops_per_sample": total_flops_per_sample / 1e12,
+        "total_tflops_per_1024_token_sample": total_flops_per_sample / 1e12 if args.tokens == 1024 else None,
         "profiler_flops_per_128_sample_gate": per_sample_flops * 128,
         "profiler_flops_per_1024_samples": per_sample_flops * 1024,
+        "total_flops_per_128_sample_gate": total_flops_per_sample * 128,
+        "total_flops_per_1024_samples": total_flops_per_sample * 1024,
+        "attention_flops_formula": (
+            "AR: layers * 4 * width * sum_t L_t(L_t+1)/2; "
+            "DLM: layers * 4 * width * forward_calls * tokens^2"
+        ),
         "wall_seconds_total": elapsed,
         "wall_seconds_per_sample": elapsed / max(args.measured_samples, 1),
         "cuda_max_memory_mib": (
             torch.cuda.max_memory_allocated() / (1024**2) if device.startswith("cuda") else 0.0
         ),
         "profiler": "torch.profiler.profile(with_flops=True)",
-        "cost_accounting_version": "v0.1-torch-profiler-actual-sampler",
-        "profiler_caveat": "PyTorch reports FLOPs only for supported operators; keep this with sampler config.",
+        "cost_accounting_version": "v0.2-torch-profiler-plus-sdpa-estimate",
+        "profiler_caveat": (
+            "PyTorch reports FLOPs only for supported operators. total_* fields add the attention "
+            "formula only for the part not already measured by PyTorch."
+        ),
     }
 
     if args.output_json:
