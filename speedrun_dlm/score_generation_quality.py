@@ -110,6 +110,8 @@ def load_verified_sample_manifest(
     sample_path = manifest_path.parent / str(sample_sets[0].get("sample_path", ""))
     if not sample_path.is_file():
         raise FileNotFoundError(f"Sample file referenced by {manifest_path} is unavailable: {sample_path}")
+    if sample_sets[0].get("sample_sha256") != sha256_file(sample_path):
+        raise ValueError(f"Generated-sample hash does not match {manifest_path}")
     sample_payload = json.loads(sample_path.read_text())
     try:
         training_seed = int(evaluation["training_seed"])
@@ -190,9 +192,8 @@ def record_scoring_provenance(
         "score_batch_size": args.score_batch_size,
         "reference_device_map": args.reference_device_map,
         "allow_fineweb_fallback": bool(args.allow_fineweb_fallback),
-        "significance_required": bool(args.require_significance),
         "sample_scores_sha256": sha256_file(output_dir / "scores" / "sample_scores.csv"),
-        "sample_passes_sha256": sha256_file(output_dir / "sample_passes.csv"),
+        "sample_outcomes_sha256": sha256_file(output_dir / "sample_outcomes.csv"),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -228,13 +229,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def binom_tail_ge(n: int, x: int, p0: float) -> float:
-    total = 0.0
-    for k in range(x, n + 1):
-        total += math.comb(n, k) * (p0**k) * ((1.0 - p0) ** (n - k))
-    return min(1.0, max(0.0, total))
 
 
 def deterministic_pass(row: dict[str, str], rule: dict[str, Any]) -> bool:
@@ -383,6 +377,7 @@ def generate_sample_manifest(
                         "family": "candidate",
                         "protocol": "unconditional",
                         "sample_path": str(sample_json.relative_to(output_dir)),
+                        "sample_sha256": sha256_file(sample_json),
                         "source_path": checkpoint_label,
                         "subjective_tier": None,
                         "gate_label": "candidate_pass",
@@ -468,15 +463,14 @@ def score_generated_samples(
     return output_dir / "scores" / "sample_scores.csv"
 
 
-def summarize_scores(
+def write_sample_outcomes(
     sample_scores: Path,
     output_dir: Path,
     rule: dict[str, Any],
     reference_model: str,
-    require_significance: bool,
     temperature: float,
     top_k: int,
-) -> tuple[bool, list[dict[str, Any]]]:
+) -> tuple[int, int, list[dict[str, Any]]]:
     rows = [
         row
         for row in read_csv(sample_scores)
@@ -506,14 +500,10 @@ def summarize_scores(
 
     total = len(rows)
     pass_rate = passed / total
-    threshold = float(rule["pass_rate_threshold"])
-    p_value = binom_tail_ge(total, passed, threshold)
-    significance_pass = not require_significance or p_value < float(rule["significance_p_value"])
-    overall_pass = pass_rate >= threshold and significance_pass
-    write_csv(output_dir / "sample_passes.csv", summaries)
+    write_csv(output_dir / "sample_outcomes.csv", summaries)
 
     lines = [
-        "# Quality Gate Result",
+        "# Checkpoint Sample Outcomes",
         "",
         f"- reference model: `{reference_model}`",
         f"- evaluation randomness: `checkpoint-derived ({SEED_PROTOCOL})`",
@@ -522,10 +512,9 @@ def summarize_scores(
         f"- samples: `{total}`",
         f"- passing samples: `{passed}`",
         f"- pass rate: `{pass_rate:.4f}`",
-        f"- required pass rate: `{threshold:.4f}`",
-        f"- exact binomial p-value vs threshold: `{p_value:.6g}`",
-        f"- significance required: `{require_significance}`",
-        f"- overall pass: `{overall_pass}`",
+        "",
+        "This is a descriptive result for one checkpoint. The official quality-gate result is computed by "
+        "`records/make_record.py` after pooling the sample outcomes from all 50 training seeds.",
         "",
         "## Rule",
         "",
@@ -545,11 +534,13 @@ def summarize_scores(
         f"- bad characters: `bad_char_count <= {rule['max_bad_char_count']}`",
     ]
     (output_dir / "README.md").write_text("\n".join(lines) + "\n")
-    return overall_pass, summaries
+    return total, passed, summaries
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate unconditional samples from a checkpoint and apply the v0 quality gate.")
+    parser = argparse.ArgumentParser(
+        description="Generate unconditional samples from one checkpoint and record their quality outcomes."
+    )
     parser.add_argument("checkpoint", help="Checkpoint whose contents determine all evaluation randomness.")
     parser.add_argument(
         "--reuse_samples_from",
@@ -561,7 +552,6 @@ def main() -> None:
     parser.add_argument("--rule_json", default=str(REPO_ROOT / "generation_quality_rule.json"))
     parser.add_argument("--reference_model", default="")
     parser.add_argument("--pinned_reference_model", default="")
-    parser.add_argument("--require_significance", action="store_true")
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -588,6 +578,8 @@ def main() -> None:
 
     total_start = time.perf_counter()
     output_dir = Path(args.output_dir).resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError(f"Output directory must be new or empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     rule_path = Path(args.rule_json).resolve()
     rule = json.loads(rule_path.read_text())
@@ -656,12 +648,11 @@ def main() -> None:
         args.allow_fineweb_fallback,
     )
     summarize_start = time.perf_counter()
-    passed, _ = summarize_scores(
+    total_samples, passing_samples, _ = write_sample_outcomes(
         sample_scores,
         output_dir,
         rule,
         reference_model,
-        require_significance=args.require_significance,
         temperature=temperatures.pop(),
         top_k=top_ks.pop(),
     )
@@ -673,8 +664,12 @@ def main() -> None:
         pinned_reference_model,
         args,
     )
-    timing("summarize_scores", time.perf_counter() - summarize_start)
-    print(f"QUALITY_GATE_RESULT pass={str(passed).lower()} report={output_dir / 'README.md'}", flush=True)
+    timing("write_sample_outcomes", time.perf_counter() - summarize_start)
+    print(
+        f"QUALITY_SAMPLE_RESULT samples={total_samples} passing_samples={passing_samples} "
+        f"pass_rate={passing_samples / total_samples:.6f} report={output_dir / 'README.md'}",
+        flush=True,
+    )
     timing("total", time.perf_counter() - total_start)
 
 

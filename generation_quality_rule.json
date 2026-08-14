@@ -1,13 +1,14 @@
 {
-  "version": "v0-strict-doccoh-checkpoint-seeds-b16",
+  "version": "v0-strict-doccoh-checkpoint-seeds-b16-pooled",
   "official_training_seed_start": 1,
   "official_training_seed_end": 50,
+  "official_samples_per_training_seed": 128,
+  "official_min_passing_samples": 4881,
   "official_sampling_batch_size": 16,
   "candidate_reference_model": "Qwen/Qwen2.5-7B",
   "pinned_reference_model": "d149729398750b98c0af14eb82c78cfe92750796",
   "deterministic_preset": "medium",
   "bpb_threshold": 2.1,
-  "pass_rate_threshold": 0.75,
   "max_bad_char_count": 0.0,
   "order_protocols": [
     "unconditional"
@@ -22,6 +23,5 @@
   "doc_coherence_min_corruptions": 5.0,
   "doc_coherence_win_rate_threshold": null,
   "doc_coherence_margin_threshold": -0.2,
-  "doc_coherence_kind_margin_thresholds": {},
-  "significance_p_value": 0.01
+  "doc_coherence_kind_margin_thresholds": {}
 }

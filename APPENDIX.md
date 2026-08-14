@@ -1,13 +1,11 @@
 # speedrun-dlm: Appendix
 
-
 This appendix provides a few extra details about the code.
 
 ## Models
 
 - `dlm`: small shared DDiT backbone used for all DLM objectives and samplers ([model](speedrun_dlm/train_dlm.py)).
 - `ar`: nanoGPT-2 causal transformer ([model](speedrun_dlm/train_ar.py), purely for reference).
-
 
 For reference, these are the DDiT parts we match. The code here is our own re-implementation, so any mistake is ours.
 
@@ -17,7 +15,6 @@ For reference, these are the DDiT parts we match. The code here is our own re-im
 | non-causal DDiT block with RoPE and adaLN-Zero gates | [MDLM](https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/models/dit.py#L214-L288), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/model/transformer.py#L118-L189), [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L305-L379) |
 | final LayerNorm + adaLN modulation + linear head | [MDLM](https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/models/dit.py#L302-L321), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/model/transformer.py#L207-L224), [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L406-L428) |
 | dense and weighted embedding inputs | [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L382-L403) |
-
 
 ## DLM objectives
 
@@ -54,17 +51,16 @@ Sampler names are listed in [`sample_text.py`](speedrun_dlm/sample_text.py).
 | SEDD | [SEDD](https://arxiv.org/abs/2310.16834) | `sedd_euler`, `sedd_analytic` |
 | DUO | [DUO](https://arxiv.org/abs/2506.10892), [Psi samplers](https://arxiv.org/abs/2602.21185) | `duo_ancestral`, `duo_greedy_tail`, `duo_psi_rescale`, `duo_psi_capped`, `duo_psi_loop` |
 
-
 ## DDiT and AR reference
 
-The benchmark fixes a small DDiT backbone at roughly nanoGPT-2 scale, diffusion-specific changes on top. The nanoGPT-2 reference comes from the first commit of the repository [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), yielding the code in `speedrun_dlm/train_ar.py` (up to minor changes).
+The benchmark fixes a small DDiT backbone at roughly nanoGPT-2 scale, with diffusion-specific changes on top. The nanoGPT-2 reference comes from the first commit of the repository [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), yielding the code in `speedrun_dlm/train_ar.py` (up to minor changes).
 We then adapted it to diffusion language models in `speedrun_dlm/train_dlm.py`.
 
 Compared with the AR reference, DDiT adds parameters mainly through the untied output head. The time embedding and adaptive layer norm add much less.
 
 ![nanoGPT-2 vs DDiT total parameters](assets/figures/architecture-params-total.svg)
 
-As a reference point, `train_ar.py` reaches the gate in **40.6s** on average over 50 seeds. It passes **49 out of 50 seeds** under the current gate (the failed seed has 106 passing samples out of 128, below the required 108). This AR run is not part of the DLM leaderboard, but the record artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
+As a historical reference point, `train_ar.py` reached the previous per-seed gate in **40.6s** on average over 50 seeds. This AR run is not part of the DLM leaderboard, and it predates the checkpoint-derived evaluation seeds and pooled decision, but its record artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
 
 One of the main promises of DLMs is lower inference cost: as they can generate many tokens in parallel, they may use fewer model calls than the sequence length. However, the cost of each call matters too. Compared with KV-cached AR generation, DLMs face two main sources of extra FLOPs. First, the use of a KV-cache is in general not possible, so the attention cost remains quadratic in the length of the block being denoised instead of becoming linear. Second, bidirectional attention doubles the attention pairs and the number of token positions processed by each linear layer compared with a causal forward pass.
 
@@ -74,12 +70,24 @@ This should not be read as saying that caching is unimportant for DLMs. Quite th
 
 More details: [per-block compute](assets/figures/architecture-flops-per-layer.svg), [cost accounting](assets/figures/architecture-additional-flops.svg).
 
-
 The figures are made with:
 
 ```bash
 python assets/figures/make_architecture_plots.py
 ```
+
+## Statistical interpretation of the quality gate
+
+The gate requires at least 4881 of the 6400 generated sequences to pass the per-sample quality rule. If the 50 training seeds were to yield i.i.d. per-sample outcomes with the same pass probability `p`, this would be a [one-sided binomial test](https://en.wikipedia.org/wiki/Binomial_test) with significance level `α=0.01` for the null hypothesis that `p ≤ 0.75`. The threshold of `4881` is the smallest integer such that the binomial probability of passing at least that many samples is less than `0.01` under the null hypothesis. This can be verified with SciPy:
+
+```python
+from scipy.stats import binomtest
+
+assert binomtest(4880, 6400, 0.75, alternative="greater").pvalue >= 0.01
+assert binomtest(4881, 6400, 0.75, alternative="greater").pvalue < 0.01
+```
+
+The same test applies to *average* pass probabilities across the 50 training seeds when pass probabilities differ between checkpoints, see [Hoeffding (1956), 5](https://doi.org/10.1214/aoms/1177728178).
 
 ## Inference cost accounting
 

@@ -4,7 +4,7 @@
 The script copies machine-readable outputs into stable filenames:
 
 - training_runs.jsonl: one TRAIN_RESULT JSON object per seed.
-- gate_passes.tsv: one quality-gate summary row per seed.
+- quality_gate.json: one decision from all sample outcomes.
 - auxiliary_metrics.json: inference-cost profiler output plus diversity metrics.
 - commands.jsonl: command templates used to train, gate, and profile the entry.
 - environment.json: training-time hardware and software version snapshot.
@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import re
 import shutil
 import sys
@@ -67,10 +66,12 @@ RECORDS_CSV_FIELDS = [
     "parameters_total",
     "non_embedding_parameters",
     "seeds",
-    "passes",
+    "passing_samples",
+    "samples",
+    "pass_rate",
+    "quality_gate_pass",
     "mean_timed_seconds",
     "mean_wall_seconds",
-    "mean_pass_rate",
     "sampler",
     "nmc",
     "inference_tflops_per_1024_token_sample",
@@ -96,29 +97,6 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def read_tsv(path: Path) -> list[dict[str, str]]:
-    with path.open(newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
-
-
-def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        raise ValueError("cannot write empty TSV")
-    fields = list(rows[0])
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, delimiter="\t", fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def binom_tail_ge(total: int, observed: int, threshold: float) -> float:
-    """P[X >= observed] for X~Binomial(total, threshold)."""
-    prob = 0.0
-    for k in range(observed, total + 1):
-        prob += math.comb(total, k) * (threshold**k) * ((1.0 - threshold) ** (total - k))
-    return prob
-
-
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
@@ -131,7 +109,11 @@ def official_training_seeds(rule: dict[str, Any]) -> tuple[int, ...]:
     return tuple(range(start, end + 1))
 
 
-def parse_gate_dir(raw_path: str, rule: dict[str, Any], require_significance: bool) -> dict[str, Any]:
+def parse_gate_dir(
+    raw_path: str,
+    rule: dict[str, Any],
+    for_official_submission: bool,
+) -> dict[str, Any]:
     gate_dir = Path(raw_path)
     manifest_path = gate_dir / "sample_manifest.json"
     if not manifest_path.exists():
@@ -163,7 +145,6 @@ def parse_gate_dir(raw_path: str, rule: dict[str, Any], require_significance: bo
         "score_batch_size": 4,
         "reference_device_map": "",
         "allow_fineweb_fallback": False,
-        "significance_required": True,
     }
     scoring = manifest.get("scoring")
     if not isinstance(scoring, dict):
@@ -172,21 +153,27 @@ def parse_gate_dir(raw_path: str, rule: dict[str, Any], require_significance: bo
         if scoring.get(key) != expected:
             raise ValueError(f"official scorer setting {key!r} is invalid in {manifest_path}")
 
-    sample_passes = gate_dir / "sample_passes.csv"
-    if not sample_passes.exists():
-        raise FileNotFoundError(f"missing {sample_passes}")
+    sample_outcomes = gate_dir / "sample_outcomes.csv"
+    if not sample_outcomes.exists():
+        raise FileNotFoundError(f"missing {sample_outcomes}")
     sample_scores = gate_dir / "scores" / "sample_scores.csv"
     if not sample_scores.exists():
         raise FileNotFoundError(f"missing {sample_scores}")
     if scoring.get("sample_scores_sha256") != sha256_file(sample_scores):
         raise ValueError(f"sample-score hash does not match {manifest_path}")
-    if scoring.get("sample_passes_sha256") != sha256_file(sample_passes):
-        raise ValueError(f"sample-pass hash does not match {manifest_path}")
+    if scoring.get("sample_outcomes_sha256") != sha256_file(sample_outcomes):
+        raise ValueError(f"sample-outcome hash does not match {manifest_path}")
     sample_rows = sample_payload.get("samples")
-    if len(sample_rows) != 128:
-        raise ValueError("official quality gates must contain exactly 128 generated samples")
+    expected_samples = int(rule["official_samples_per_training_seed"])
+    if for_official_submission and len(sample_rows) != expected_samples:
+        raise ValueError(
+            "quality gates for official submission must contain exactly "
+            f"{expected_samples} generated samples"
+        )
+    if not sample_rows:
+        raise ValueError(f"quality gate contains no generated samples: {gate_dir}")
 
-    with sample_passes.open(newline="") as handle:
+    with sample_outcomes.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     with sample_scores.open(newline="") as handle:
         score_rows = [
@@ -197,31 +184,27 @@ def parse_gate_dir(raw_path: str, rule: dict[str, Any], require_significance: bo
         ]
     samples = len(rows)
     if samples != len(sample_rows) or len(score_rows) != samples:
-        raise ValueError(f"sample-pass count does not match generated sample count in {gate_dir}")
+        raise ValueError(f"sample-outcome count does not match generated sample count in {gate_dir}")
     for index, (row, score_row) in enumerate(zip(rows, score_rows, strict=True)):
         score_sample_id = score_row.get("sample_id", score_row.get("sample_index", ""))
         if row.get("sample_id") != score_sample_id:
-            raise ValueError(f"sample {index} is misaligned between scores and passes in {gate_dir}")
+            raise ValueError(f"sample {index} is misaligned between scores and outcomes in {gate_dir}")
         if truthy(row.get("pass", 0)) != sample_pass(score_row, rule):
-            raise ValueError(f"sample {index} pass was not produced by the official rule in {gate_dir}")
+            raise ValueError(f"sample {index} outcome was not produced by the official rule in {gate_dir}")
     passing = sum(sample_pass(row, rule) for row in score_rows)
     pass_rate = passing / samples if samples else 0.0
-    threshold = float(rule["pass_rate_threshold"])
-    p_value = binom_tail_ge(samples, passing, threshold)
-    overall_pass = pass_rate >= threshold and (
-        not require_significance or p_value < float(rule["significance_p_value"])
-    )
     return {
         "seed": seed,
         "sampling_seed": expected_seeds["sampling"],
         "checkpoint_sha256": checkpoint_sha256,
         "seed_protocol": SEED_PROTOCOL,
+        "sample_manifest_sha256": sha256_file(manifest_path),
+        "sample_sha256": manifest["sample_sets"][0]["sample_sha256"],
+        "sample_scores_sha256": scoring["sample_scores_sha256"],
+        "sample_outcomes_sha256": scoring["sample_outcomes_sha256"],
         "samples": samples,
         "passing_samples": passing,
-        "pass_rate": f"{pass_rate:.4f}",
-        "exact_binomial_p_value_vs_threshold": f"{p_value:.6g}",
-        "significance_required": str(bool(require_significance)),
-        "overall_pass": str(bool(overall_pass)),
+        "pass_rate": pass_rate,
     }
 
 
@@ -373,6 +356,11 @@ def mean(values: list[float]) -> float:
 
 def append_records_csv(path: Path, row: dict[str, Any]) -> None:
     exists = path.exists()
+    if exists:
+        with path.open(newline="") as handle:
+            existing_fields = next(csv.reader(handle), [])
+        if existing_fields != RECORDS_CSV_FIELDS:
+            raise ValueError(f"{path} does not use the current quality-gate leaderboard columns")
     with path.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RECORDS_CSV_FIELDS, lineterminator="\n")
         if not exists:
@@ -382,14 +370,14 @@ def append_records_csv(path: Path, row: dict[str, Any]) -> None:
 
 def validate_record_rows(
     training_rows: list[dict[str, Any]],
-    gate_rows: list[dict[str, str]],
+    gate_rows: list[dict[str, Any]],
     rule: dict[str, Any],
-    min_passes: int | None,
+    experimental: bool,
 ) -> None:
     if not training_rows:
         raise SystemExit("training_runs.jsonl is empty")
     if not gate_rows:
-        raise SystemExit("gate_passes.tsv is empty")
+        raise SystemExit("no quality-gate outputs were provided")
     if len(training_rows) != len(gate_rows):
         raise SystemExit(
             f"expected one gate row per training seed, got {len(training_rows)} training rows "
@@ -399,29 +387,65 @@ def validate_record_rows(
     seed_range = f"{expected_seeds[0]} through {expected_seeds[-1]}"
     train_seed_list = sorted(int(row["seed"]) for row in training_rows)
     gate_seed_list = sorted(int(row["seed"]) for row in gate_rows)
-    if train_seed_list != expected_seeds:
-        raise SystemExit(f"official records must contain every training seed from {seed_range} exactly once")
-    if gate_seed_list != expected_seeds:
-        raise SystemExit(f"official records must contain one verified gate output for every seed from {seed_range}")
-    train_seeds = {str(row.get("seed")) for row in training_rows if row.get("seed") is not None}
-    gate_seeds = {str(row.get("seed")) for row in gate_rows if row.get("seed")}
-    if train_seeds and gate_seeds and train_seeds != gate_seeds:
+    if len(train_seed_list) != len(set(train_seed_list)):
+        raise SystemExit("training seed list contains duplicates")
+    if len(gate_seed_list) != len(set(gate_seed_list)):
+        raise SystemExit("quality-gate seed list contains duplicates")
+    if train_seed_list != gate_seed_list:
         raise SystemExit(
             "training and gate seed sets differ: "
-            f"training={sorted(train_seeds, key=int)} gate={sorted(gate_seeds, key=int)}"
+            f"training={train_seed_list} gate={gate_seed_list}"
         )
-    passes = 0
+    if not experimental and train_seed_list != expected_seeds:
+        raise SystemExit(f"official records must contain every training seed from {seed_range} exactly once")
     for row in gate_rows:
         if row.get("seed_protocol") != SEED_PROTOCOL or not row.get("checkpoint_sha256"):
             seed = row.get("seed", "<unknown>")
             raise SystemExit(f"seed {seed} does not have verified checkpoint-derived evaluation seeds")
-        if not truthy(row.get("significance_required", "")):
-            seed = row.get("seed", "<unknown>")
-            raise SystemExit(f"seed {seed} was not checked with the required significance rule")
-        passes += int(truthy(row.get("overall_pass", "")))
-    required = len(gate_rows) if min_passes is None else min_passes
-    if passes < required:
-        raise SystemExit(f"expected at least {required} passing seeds, got {passes}/{len(gate_rows)}")
+
+
+def aggregate_quality_gate(
+    gate_rows: list[dict[str, Any]],
+    rule: dict[str, Any],
+    for_official_submission: bool,
+) -> dict[str, Any]:
+    gate_rows = sorted(gate_rows, key=lambda row: int(row["seed"]))
+    total_samples = sum(int(row["samples"]) for row in gate_rows)
+    passing_samples = sum(int(row["passing_samples"]) for row in gate_rows)
+    if total_samples <= 0:
+        raise ValueError("cannot evaluate an empty sample set")
+    pass_rate = passing_samples / total_samples
+    minimum_passing_samples = int(rule["official_min_passing_samples"])
+    official_sample_count = len(official_training_seeds(rule)) * int(
+        rule["official_samples_per_training_seed"]
+    )
+    if not 1 <= minimum_passing_samples <= official_sample_count:
+        raise ValueError("official minimum passing-sample count is outside the official sample range")
+    if for_official_submission and total_samples != official_sample_count:
+        raise ValueError(
+            f"official submissions must contain exactly {official_sample_count} samples, "
+            f"got {total_samples}"
+        )
+    passes = passing_samples >= minimum_passing_samples if for_official_submission else None
+    return {
+        "version": 1,
+        "aggregation": "all-samples",
+        "for_official_submission": for_official_submission,
+        "rule_version": rule["version"],
+        "rule_sha256": sha256_file(ROOT / "generation_quality_rule.json"),
+        "evaluation_seed_protocol": SEED_PROTOCOL,
+        "training_seeds": [int(row["seed"]) for row in gate_rows],
+        "runs": gate_rows,
+        "samples": total_samples,
+        "passing_samples": passing_samples,
+        "pass_rate": pass_rate,
+        "minimum_passing_samples": minimum_passing_samples,
+        "passes": passes,
+    }
+
+
+def write_quality_gate(path: Path, quality_gate: dict[str, Any]) -> None:
+    path.write_text(json.dumps(quality_gate, indent=2, sort_keys=True) + "\n")
 
 
 def model_calls_for_gate_sample(args: argparse.Namespace, inference: dict[str, Any]) -> int:
@@ -438,13 +462,11 @@ def build_records_row(
     args: argparse.Namespace,
     record_dir: Path,
     training_rows: list[dict[str, Any]],
-    gate_rows: list[dict[str, str]],
+    quality_gate: dict[str, Any],
     auxiliary: dict[str, Any],
 ) -> dict[str, Any]:
     inference = auxiliary["inference_cost"]
     first_train = training_rows[0]
-    passes = sum(str(row.get("overall_pass", "")).lower() == "true" for row in gate_rows)
-    pass_rates = [float(row["pass_rate"]) for row in gate_rows]
     parameters_total = first_train.get("num_parameters") or inference.get("num_parameters", "")
     non_embedding_parameters = first_train.get("non_embedding_parameters") or inference.get("non_embedding_parameters", "")
     tflops = float(
@@ -475,10 +497,12 @@ def build_records_row(
         "parameters_total": parameters_total,
         "non_embedding_parameters": non_embedding_parameters,
         "seeds": len(training_rows),
-        "passes": passes,
+        "passing_samples": quality_gate["passing_samples"],
+        "samples": quality_gate["samples"],
+        "pass_rate": f"{quality_gate['pass_rate']:.6f}",
+        "quality_gate_pass": quality_gate["passes"],
         "mean_timed_seconds": f"{mean(timed):.1f}",
         "mean_wall_seconds": f"{mean(wall):.1f}",
-        "mean_pass_rate": f"{mean(pass_rates):.4f}",
         "sampler": args.sampler,
         "nmc": model_calls_for_gate_sample(args, inference),
         "inference_tflops_per_1024_token_sample": f"{tflops:.4f}",
@@ -505,7 +529,15 @@ def main() -> None:
     parser.add_argument("--sampler", required=True)
     parser.add_argument("--benchmark-label", default="")
     parser.add_argument("--method-reference", default="")
-    parser.add_argument("--min-passes", type=int, help="Required passing seeds. Defaults to all included seeds.")
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help=(
+            "Allow any nonempty matching subset of training and gate seeds, and any positive sample count, "
+            "for development. The result is marked as not for official submission and cannot be appended "
+            "to the leaderboard CSV."
+        ),
+    )
     parser.add_argument("--nmc", type=int, help="Model calls used to generate one 1024-token gate sample.")
     parser.add_argument("--ar-reference-tflops", type=float, default=AR_REFERENCE_TFLOPS)
     parser.add_argument(
@@ -548,16 +580,35 @@ def main() -> None:
     if not args.training_runs_jsonl and not args.train_result_json and not args.train_log:
         raise SystemExit("Provide --training-runs-jsonl, --train-result-json, or --train-log.")
     if not args.gate_dir:
-        raise SystemExit("Provide one --gate-dir for each official training seed.")
+        raise SystemExit("Provide at least one --gate-dir.")
+    if args.experimental and args.records_csv:
+        raise SystemExit("experimental results cannot be appended to the leaderboard CSV")
 
     record_dir = Path(args.record_dir)
+    if record_dir.exists() and any(record_dir.iterdir()):
+        raise SystemExit(f"record directory must be new or empty: {record_dir}")
     record_dir.mkdir(parents=True, exist_ok=True)
     training_rows = copy_training_runs(record_dir, args.training_runs_jsonl, args.train_result_json, args.train_log)
 
     rule = json.loads((ROOT / "generation_quality_rule.json").read_text())
-    write_tsv(record_dir / "gate_passes.tsv", [parse_gate_dir(spec, rule, True) for spec in args.gate_dir])
-    gate_rows = read_tsv(record_dir / "gate_passes.tsv")
-    validate_record_rows(training_rows, gate_rows, rule, args.min_passes)
+    gate_rows = [
+        parse_gate_dir(spec, rule, for_official_submission=not args.experimental)
+        for spec in args.gate_dir
+    ]
+    gate_rows.sort(key=lambda row: int(row["seed"]))
+    validate_record_rows(training_rows, gate_rows, rule, experimental=args.experimental)
+    quality_gate = aggregate_quality_gate(
+        gate_rows,
+        rule,
+        for_official_submission=not args.experimental,
+    )
+    write_quality_gate(record_dir / "quality_gate.json", quality_gate)
+    if not args.experimental and not quality_gate["passes"]:
+        raise SystemExit(
+            "quality gate failed: "
+            f"{quality_gate['passing_samples']}/{quality_gate['samples']} samples passed "
+            f"(need at least {quality_gate['minimum_passing_samples']})"
+        )
 
     auxiliary = write_auxiliary_metrics(
         record_dir,
@@ -570,7 +621,7 @@ def main() -> None:
     copy_environment_json(record_dir, args.environment_json)
     write_recipe_snapshot(record_dir, args.source_file or DEFAULT_SOURCE_FILES, args.snapshot_note)
 
-    row = build_records_row(args, record_dir, training_rows, gate_rows, auxiliary)
+    row = build_records_row(args, record_dir, training_rows, quality_gate, auxiliary)
     if args.records_csv:
         append_records_csv(args.records_csv, row)
 

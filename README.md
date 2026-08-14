@@ -9,12 +9,13 @@ enough to pass a simple quality gate.
 **The leaderboard is based on generated samples passing this gate (using Gen. PPL plus additional checks for failure modes of PPL alone, like token repetition and coherence).**
 
 The **gate** checks for:
+
 - too much repetition,
 - basic document coherence,
 - quality according to a pinned reference LLM (`Qwen2.5-7B`),
 - other simple heuristics (more details below).
 
-The project is inspired by Keller Jordan and collaborators' **[modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, adapted to diffusion language models**, where many core design choices are still open.
+The project is inspired by Keller Jordan and collaborators' **[modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun** and adapts it to diffusion language models, for which many core design choices are still open.
 
 We fix a small DDiT backbone (170M parameters) and include re-implementations of **7 common single-block diffusion objectives** in `speedrun_dlm/train_dlm.py`.
 
@@ -37,17 +38,20 @@ We fix a small DDiT backbone (170M parameters) and include re-implementations of
 
 **Runs are ranked by training time to pass the sample-quality gate.**
 
-To appear on the leaderboard, a DLM trainer+sampler must:
-- pass at least 42 out of 50 seeds, and
+To appear on the leaderboard, a DLM training-and-sampling recipe must:
+
+- pass the quality gate (see [Rules](#rules) for the exact criterion), and
 - cost less than 95.86 TFLOPs for one 1024-token sample (this threshold is explained in the [appendix](APPENDIX.md)).
 
 Small tuning changes, new samplers, and new objectives are all welcome.
 
 The FLOP cap is meant to keep samplers reasonable in terms of inference cost. A diffusion sampler could otherwise try to pass the gate by using an arbitrarily large number of denoising steps.
 
-| Rank by train time | Entry | Mean train time (used for ranking) | Gate result (need 42/50+) | 1024-token generation cost (need <95.86 TFLOPs) | Model calls for 1024 tokens | Training tokens | Training steps | Record |
+| Rank by train time | Entry | Mean train time (used for ranking) | Gate result (need ≥4881/6400) | 1024-token generation cost (need <95.86 TFLOPs) | Model calls for 1024 tokens | Training tokens | Training steps | Record |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | `subs_mask` | [27m45.2s](records/0001-subs-mask-s344/training_runs.jsonl) | [44/50 seeds](records/0001-subs-mask-s344/gate_passes.tsv) | [95.16 TFLOPs](records/0001-subs-mask-s344/auxiliary_metrics.json) | [344](records/0001-subs-mask-s344/auxiliary_metrics.json) | [3.28B](records/0001-subs-mask-s344/training_runs.jsonl) | [8000](records/0001-subs-mask-s344/training_runs.jsonl) | [0001](records/0001-subs-mask-s344/) |
+| Legacy | `subs_mask` | [27m45.2s](records/0001-subs-mask-s344/training_runs.jsonl) | Pending re-evaluation under the current rule | [95.16 TFLOPs](records/0001-subs-mask-s344/auxiliary_metrics.json) | [344](records/0001-subs-mask-s344/auxiliary_metrics.json) | [3.28B](records/0001-subs-mask-s344/training_runs.jsonl) | [8000](records/0001-subs-mask-s344/training_runs.jsonl) | [0001](records/0001-subs-mask-s344/) |
+
+Record 0001 predates the checkpoint-derived evaluation seeds and current 50-seed decision rule. It is retained for provenance and will be re-evaluated before it is ranked under the current rules.
 
 Inference TFLOPs are FLOPs counted by PyTorch while sampling, plus the attention FLOPs PyTorch did not count. See the [appendix](APPENDIX.md) for the formula.
 
@@ -56,13 +60,13 @@ Inference TFLOPs are FLOPs counted by PyTorch while sampling, plus the attention
 - Same *data*: pinned FineWeb GPT-2 tokenized data.
 - Same *scorer*: pinned `Qwen/Qwen2.5-7B`.
 - Same *hardware*: 8 H100 80GB GPUs.
-- Same *quality gate*: 128 unconditional samples of 1024 tokens.
+- Same per-sample *quality rule*: a conjunction of checks for repetition, surface validity, reference-model BPB (Gen. PPL), sentence order, and document coherence, defined exactly in [`generation_quality_rule.json`](generation_quality_rule.json) and [`score_generation_quality.py`](speedrun_dlm/score_generation_quality.py).
 - Same 50 *training seeds*: every official entry must run each integer seed from `1` through `50`.
-- Checkpoint-derived *evaluation randomness*: separate seeds for sampling, inference-cost profiling, and randomized quality checks are automatically derived from a hash of the checkpoint to evaluate. This avoids cherry-picking evaluation seeds and follows a helpful suggestion by [@JCBrouwer in issue #1](https://github.com/agonon/speedrun-dlm/issues/1). Text is sampled with a fixed batch size of 16, ensuring that a given checkpoint and seed always produce the same samples.
-- A seed passes if at least 108 out of 128 samples pass.
+- Checkpoint-derived *evaluation randomness*: separate seeds for sampling, inference-cost profiling, and randomized quality checks are automatically derived from a hash of the checkpoint to evaluate. This follows a helpful suggestion by [@JCBrouwer in issue #1](https://github.com/agonon/speedrun-dlm/issues/1). For reproducibility, text is always sampled with a fixed batch size of 16.
+- From each of the 50 trained checkpoints, generate 128 sequences of 1024 tokens, starting from a fully noised state (all mask tokens for mask-noise models or uniformly random tokens for uniform-noise models). (For comparison, AR models can start from a single token, we used GPT-2's beginning-of-text token for the AR model mentioned in the [Appendix](APPENDIX.md).)
+- Of the resulting `50 × 128 = 6400` sequences, at least `4881` must pass the per-sample quality rule. See the [Appendix](APPENDIX.md#statistical-interpretation-of-the-quality-gate) for the statistical interpretation as a one-sided binomial test.
 - A DLM sampler must cost less than 95.86 TFLOPs for one 1024-token sample.
 - Runs are ranked by mean training time over 50 seeds.
-- A record needs at least 42 out of 50 seeds to pass.
 
 While architectural modifications are acceptable, the DDiT backbone parameter count should remain comparable.
 
@@ -82,23 +86,23 @@ The diffusion-specific changes are:
 - denoising-time conditioning through adaptive layer norm,
 - untied input embedding and output head.
 
-
 See the [appendix](APPENDIX.md) for the short comparison with the AR reference used to set the FLOP cap.
 
 ## Quality gate
 
 **DLMs are not easy to compare** because:
-- there is no direct access to the **sequence-level probability** assigned by a model: unlike for AR models, this requires estimating the sum over all possible denoising paths to reach a given sample, which is expensive and leads to high variance estimates,
-- the **different losses** in current popular recipes are not directly comparable (even _if_ they constitute a variational bound of the negative log-likelihood, these bounds may have different tightness across parameterizations),
-- the **sampler** used at inference time must be taken into account since the same DLM checkpoint can produce different text depending on the sampling procedure that generates sequences.
 
-This benchmark **evaluates a trained model together with a sampler** by
-<ol>
-  <li> generating 128 samples of 1024 tokens each (starting from a fully noisy/masked sequence for DLMs), and </li>
-  <li> checking how many of the samples pass a carefully designed quality rule (repetition, fluency, etc.). </li>
-</ol>
+- there is no direct access to the **sequence-level probability** assigned by a model: unlike for an AR model, this requires estimating the sum over all possible denoising paths to reach a given sample, which is expensive and leads to high-variance estimates,
+- the **different losses** in current popular recipes are not directly comparable (even when they constitute variational bounds on the negative log-likelihood, these bounds may have different tightness across parameterizations),
+- the **sampler** used at inference time must be taken into account, since the same DLM checkpoint can produce different text under different sampling procedures.
 
-We refer to [`score_generation_quality.py`](speedrun_dlm/score_generation_quality.py) and [`generation_quality_rule.json`](generation_quality_rule.json) for the details.
+This benchmark **evaluates a trained model together with a sampler** by:
+
+1. Generating 128 unconditional samples of 1024 tokens for each of the 50 training seeds, following the initialization protocol specified in the [Rules](#rules).
+2. Applying the quality rule to every sample (repetition, fluency, etc.).
+3. Deciding whether the DLM training-and-sampling recipe passes by counting how many of the `50 × 128 = 6400` samples pass the quality rule. At least `4881` must pass for the entry to be eligible for the speedrun leaderboard.
+
+See [`score_generation_quality.py`](speedrun_dlm/score_generation_quality.py) and [`generation_quality_rule.json`](generation_quality_rule.json) for details.
 
 ## How to submit
 
@@ -127,7 +131,6 @@ python3 records/make_record.py \
   --inference-cost-json results/my_method/inference_cost.json \
   --profiled-train-seed 1 \
   --environment-json results/my_method/train_seed_1/environment.json \
-  --min-passes 42 \
   --records-csv records/records.csv
 ```
 
@@ -156,9 +159,10 @@ python3 -m speedrun_dlm.score_generation_quality path/to/checkpoint.pt \
   --top_k 0 \
   --num_sampling_steps 344 \
   --sampling_eps 1e-3 \
-  --require_significance \
   --output_dir results/gate
 ```
+
+This command records the sample-level outcomes for one checkpoint. The official pass/fail result is produced by `records/make_record.py` after all 50 outputs are provided.
 
 ```bash
 python3 -m speedrun_dlm.measure_inference_cost path/to/checkpoint.pt \
