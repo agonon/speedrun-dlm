@@ -5,7 +5,7 @@ The script copies machine-readable outputs into stable filenames:
 
 - training_runs.jsonl: one TRAIN_RESULT JSON object per seed.
 - quality_gate.json: one decision from all sample outcomes.
-- auxiliary_metrics.json: inference-cost profiler output plus diversity metrics.
+- auxiliary_metrics.json: mean inference cost across the checkpoint profiles plus diversity metrics.
 - commands.jsonl: command templates used to train, gate, and profile the entry.
 - environment.json: training-time hardware and software version snapshot.
 - recipe_snapshot.txt: source files that define the trainer, sampler, and gate.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import shutil
 import sys
@@ -56,6 +57,55 @@ DEFAULT_SOURCE_FILES = [
     "speedrun_dlm/score_generation_quality.py",
     "speedrun_dlm/measure_inference_cost.py",
 ]
+
+INFERENCE_PROFILE_SHARED_FIELDS = (
+    "trainer",
+    "checkpoint_variant",
+    "num_parameters",
+    "non_embedding_parameters",
+    "tokens_per_sample",
+    "measured_samples",
+    "warmup_samples",
+    "temperature",
+    "top_k",
+    "dlm_sampler",
+    "dlm_sampling_steps",
+    "sampling_eps",
+    "amp_dtype",
+    "profiler",
+    "cost_accounting_version",
+    "attention_flops_formula",
+    "profiler_caveat",
+)
+INFERENCE_PROFILE_MEAN_FIELDS = (
+    "forward_calls_per_sample",
+    "profiler_flops_per_1024_token_sample",
+    "profiler_tflops_per_1024_token_sample",
+    "attention_flops_measured_by_torch_per_1024_token_sample",
+    "attention_tflops_measured_by_torch_per_1024_token_sample",
+    "attention_flops_by_formula_per_1024_token_sample",
+    "attention_tflops_by_formula_per_1024_token_sample",
+    "attention_flops_added_by_formula_per_1024_token_sample",
+    "attention_tflops_added_by_formula_per_1024_token_sample",
+    "total_flops_per_1024_token_sample",
+    "total_tflops_per_1024_token_sample",
+)
+INFERENCE_GATE_SHARED_FIELDS = (
+    "trainer",
+    "checkpoint_variant",
+    "tokens_per_sample",
+    "temperature",
+    "top_k",
+    "dlm_sampler",
+    "dlm_sampling_steps",
+    "sampling_eps",
+)
+INFERENCE_PROFILE_PROTOCOL = {
+    "measured_samples": 1,
+    "warmup_samples": 1,
+    "profiler": "torch.profiler.profile(with_flops=True)",
+    "cost_accounting_version": "v0.2-torch-profiler-plus-sdpa-estimate",
+}
 
 
 RECORDS_CSV_FIELDS = [
@@ -172,6 +222,30 @@ def parse_gate_dir(
         )
     if not sample_rows:
         raise ValueError(f"quality gate contains no generated samples: {gate_dir}")
+    first_sample = sample_rows[0]
+    sampling = {
+        "trainer": first_sample.get("trainer"),
+        "checkpoint_variant": first_sample.get("checkpoint_variant"),
+        "tokens_per_sample": first_sample.get("max_new_tokens"),
+        "temperature": first_sample.get("temperature"),
+        "top_k": first_sample.get("top_k"),
+        "dlm_sampler": first_sample.get("dlm_sampler"),
+        "dlm_sampling_steps": first_sample.get("num_sampling_steps"),
+        "sampling_eps": first_sample.get("sampling_eps"),
+    }
+    for index, sample in enumerate(sample_rows):
+        current = {
+            "trainer": sample.get("trainer"),
+            "checkpoint_variant": sample.get("checkpoint_variant"),
+            "tokens_per_sample": sample.get("max_new_tokens"),
+            "temperature": sample.get("temperature"),
+            "top_k": sample.get("top_k"),
+            "dlm_sampler": sample.get("dlm_sampler"),
+            "dlm_sampling_steps": sample.get("num_sampling_steps"),
+            "sampling_eps": sample.get("sampling_eps"),
+        }
+        if current != sampling:
+            raise ValueError(f"sample {index} uses different sampling settings in {gate_dir}")
 
     with sample_outcomes.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -202,6 +276,7 @@ def parse_gate_dir(
         "sample_sha256": manifest["sample_sets"][0]["sample_sha256"],
         "sample_scores_sha256": scoring["sample_scores_sha256"],
         "sample_outcomes_sha256": scoring["sample_outcomes_sha256"],
+        "sampling": sampling,
         "samples": samples,
         "passing_samples": passing,
         "pass_rate": pass_rate,
@@ -252,11 +327,10 @@ def sanitize_train_result(record_name: str, row: dict[str, Any]) -> dict[str, An
     return row
 
 
-def sanitize_inference_cost(record_name: str, row: dict[str, Any], profiled_train_seed: int | None) -> dict[str, Any]:
+def sanitize_inference_cost(row: dict[str, Any]) -> dict[str, Any]:
     row = dict(row)
     row.pop("checkpoint_path", None)
-    if isinstance(row.get("snapshot"), str):
-        row["snapshot"] = checkpoint_uri(record_name, profiled_train_seed, row["snapshot"])
+    row.pop("snapshot", None)
     return row
 
 
@@ -315,30 +389,102 @@ def copy_environment_json(output: Path, environment_json: Path | None) -> None:
 
 def write_auxiliary_metrics(
     output: Path,
-    inference_cost_json: Path,
-    profiled_train_seed: int | None,
+    inference_cost_jsons: list[Path],
+    gate_rows: list[dict[str, Any]],
+    expected_trainer: str,
     diversity_unigram_entropy_bits: float | None,
     diversity_distinct_2: float | None,
 ) -> dict[str, Any]:
-    raw_inference = json.loads(inference_cost_json.read_text())
-    if raw_inference.get("seed_protocol") != SEED_PROTOCOL:
-        raise ValueError(f"{inference_cost_json} does not use {SEED_PROTOCOL}")
-    checkpoint = Path(str(raw_inference.get("checkpoint_path", "")))
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"profiled checkpoint is unavailable: {checkpoint}")
-    checkpoint_sha256 = sha256_file(checkpoint)
-    if checkpoint_sha256 != raw_inference.get("checkpoint_sha256"):
-        raise ValueError(f"profiled checkpoint hash does not match {inference_cost_json}")
-    expected_seed = derive_evaluation_seed(checkpoint_sha256, "inference_cost")
-    reported_seed = raw_inference.get("seed")
-    if type(reported_seed) is not int or reported_seed != expected_seed:
-        raise ValueError(
-            f"{inference_cost_json} reports inference-cost seed {reported_seed!r}; "
-            f"the official checkpoint-derived seed is {expected_seed}"
-        )
-    if profiled_train_seed is None or int(raw_inference.get("training_seed")) != profiled_train_seed:
-        raise ValueError("--profiled-train-seed must match the training seed stored in the profiled checkpoint")
-    inference = sanitize_inference_cost(output.name, raw_inference, profiled_train_seed)
+    gates_by_seed = {int(row["seed"]): row for row in gate_rows}
+    expected_hashes = {seed: row["checkpoint_sha256"] for seed, row in gates_by_seed.items()}
+    profiles_by_seed: dict[int, dict[str, Any]] = {}
+    for inference_cost_json in inference_cost_jsons:
+        raw_inference = json.loads(inference_cost_json.read_text())
+        if raw_inference.get("seed_protocol") != SEED_PROTOCOL:
+            raise ValueError(f"{inference_cost_json} does not use {SEED_PROTOCOL}")
+        training_seed = raw_inference.get("training_seed")
+        if type(training_seed) is not int:
+            raise ValueError(f"{inference_cost_json} does not contain an integer training_seed")
+        if training_seed in profiles_by_seed:
+            raise ValueError(f"duplicate inference-cost profile for training seed {training_seed}")
+        if training_seed not in expected_hashes:
+            raise ValueError(f"inference-cost profile has unexpected training seed {training_seed}")
+        checkpoint_sha256 = raw_inference.get("checkpoint_sha256")
+        if not isinstance(checkpoint_sha256, str):
+            raise ValueError(f"{inference_cost_json} does not contain a checkpoint hash")
+        if checkpoint_sha256 != expected_hashes[training_seed]:
+            raise ValueError(
+                f"inference-cost profile and quality gate use different checkpoints for seed {training_seed}"
+            )
+        expected_seed = derive_evaluation_seed(checkpoint_sha256, "inference_cost")
+        reported_seed = raw_inference.get("seed")
+        if type(reported_seed) is not int or reported_seed != expected_seed:
+            raise ValueError(
+                f"{inference_cost_json} reports inference-cost seed {reported_seed!r}; "
+                f"the official checkpoint-derived seed is {expected_seed}"
+            )
+        if raw_inference.get("trainer") != expected_trainer:
+            raise ValueError(
+                f"{inference_cost_json} profiles trainer {raw_inference.get('trainer')!r}, "
+                f"expected {expected_trainer!r}"
+            )
+        gate_sampling = gates_by_seed[training_seed]["sampling"]
+        for field in INFERENCE_GATE_SHARED_FIELDS:
+            if raw_inference.get(field) != gate_sampling[field]:
+                raise ValueError(
+                    f"inference-cost profile and quality gate use different {field} "
+                    f"for seed {training_seed}"
+                )
+        for field, expected in INFERENCE_PROFILE_PROTOCOL.items():
+            if raw_inference.get(field) != expected:
+                raise ValueError(
+                    f"inference-cost profile for seed {training_seed} must use {field}={expected!r}"
+                )
+        profiles_by_seed[training_seed] = sanitize_inference_cost(raw_inference)
+
+    if set(profiles_by_seed) != set(expected_hashes):
+        missing = sorted(set(expected_hashes) - set(profiles_by_seed))
+        raise ValueError(f"missing inference-cost profiles for training seeds {missing}")
+
+    profiles = [profiles_by_seed[seed] for seed in sorted(profiles_by_seed)]
+    for field in INFERENCE_PROFILE_SHARED_FIELDS:
+        if field not in profiles[0]:
+            raise ValueError(f"inference-cost profiles do not contain {field}")
+    shared = {field: profiles[0].get(field) for field in INFERENCE_PROFILE_SHARED_FIELDS}
+    for profile in profiles[1:]:
+        for field, expected in shared.items():
+            if profile.get(field) != expected:
+                raise ValueError(
+                    f"inference-cost profiles use different {field}: "
+                    f"seed {profiles[0]['training_seed']} has {expected!r}, "
+                    f"seed {profile['training_seed']} has {profile.get(field)!r}"
+                )
+    means = {}
+    for field in INFERENCE_PROFILE_MEAN_FIELDS:
+        values = [profile.get(field) for profile in profiles]
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
+            raise ValueError(f"inference-cost profiles must contain finite numeric {field}")
+        means[field] = mean(values)
+    published_profiles = [
+        {
+            "training_seed": profile["training_seed"],
+            "checkpoint_sha256": profile["checkpoint_sha256"],
+            "seed": profile["seed"],
+            **{field: profile[field] for field in INFERENCE_PROFILE_MEAN_FIELDS},
+        }
+        for profile in profiles
+    ]
+
+    inference = {
+        "version": 1,
+        "aggregation": "mean-across-training-seeds",
+        "seed_protocol": SEED_PROTOCOL,
+        "profile_count": len(profiles),
+        "training_seeds": sorted(profiles_by_seed),
+        "shared": shared,
+        "mean": means,
+        "profiles": published_profiles,
+    }
     auxiliary = {
         "inference_cost": inference,
         "diversity": {
@@ -463,16 +609,6 @@ def write_quality_gate(path: Path, quality_gate: dict[str, Any]) -> None:
     path.write_text(json.dumps(quality_gate, indent=2, sort_keys=True) + "\n")
 
 
-def model_calls_for_gate_sample(args: argparse.Namespace, inference: dict[str, Any]) -> int:
-    if args.nmc is not None:
-        return args.nmc
-    if args.trainer == "dlm" and inference.get("dlm_sampling_steps"):
-        return int(float(inference["dlm_sampling_steps"]))
-    if args.trainer == "ar" and inference.get("tokens_per_sample"):
-        return int(float(inference["tokens_per_sample"]))
-    return int(float(inference["forward_calls_per_sample"]))
-
-
 def build_records_row(
     args: argparse.Namespace,
     record_dir: Path,
@@ -481,16 +617,18 @@ def build_records_row(
     auxiliary: dict[str, Any],
 ) -> dict[str, Any]:
     inference = auxiliary["inference_cost"]
+    inference_shared = inference["shared"]
+    inference_mean = inference["mean"]
     first_train = training_rows[0]
-    parameters_total = first_train.get("num_parameters") or inference.get("num_parameters", "")
-    non_embedding_parameters = first_train.get("non_embedding_parameters") or inference.get("non_embedding_parameters", "")
+    parameters_total = first_train.get("num_parameters") or inference_shared.get("num_parameters", "")
+    non_embedding_parameters = first_train.get("non_embedding_parameters") or inference_shared.get("non_embedding_parameters", "")
     tflops = float(
-        inference.get("total_tflops_per_1024_token_sample")
-        or inference["profiler_tflops_per_1024_token_sample"]
+        inference_mean.get("total_tflops_per_1024_token_sample")
+        or inference_mean["profiler_tflops_per_1024_token_sample"]
     )
-    profiler_tflops = float(inference["profiler_tflops_per_1024_token_sample"])
+    profiler_tflops = float(inference_mean["profiler_tflops_per_1024_token_sample"])
     attention_tflops = float(
-        inference.get("attention_tflops_added_by_formula_per_1024_token_sample")
+        inference_mean.get("attention_tflops_added_by_formula_per_1024_token_sample")
         or 0.0
     )
     tflops_vs_ar = tflops / args.ar_reference_tflops
@@ -519,7 +657,7 @@ def build_records_row(
         "mean_timed_seconds": f"{mean(timed):.1f}",
         "mean_wall_seconds": f"{mean(wall):.1f}",
         "sampler": args.sampler,
-        "nmc": model_calls_for_gate_sample(args, inference),
+        "nmc": f"{inference_mean['forward_calls_per_sample']:.2f}",
         "inference_tflops_per_1024_token_sample": f"{tflops:.4f}",
         "torch_profiler_tflops_per_1024_token_sample": f"{profiler_tflops:.4f}",
         "attention_tflops_added_by_formula": f"{attention_tflops:.4f}",
@@ -553,7 +691,6 @@ def main() -> None:
             "to the leaderboard CSV."
         ),
     )
-    parser.add_argument("--nmc", type=int, help="Model calls used to generate one 1024-token gate sample.")
     parser.add_argument("--ar-reference-tflops", type=float, default=AR_REFERENCE_TFLOPS)
     parser.add_argument(
         "--ar-reference-total-parameters",
@@ -571,12 +708,12 @@ def main() -> None:
         default=[],
         help="Repeat with each scorer output directory; its training seed is read from sample_manifest.json.",
     )
-    parser.add_argument("--inference-cost-json", type=Path, required=True)
     parser.add_argument(
-        "--profiled-train-seed",
-        type=int,
+        "--inference-cost-json",
+        type=Path,
+        action="append",
         required=True,
-        help="Training seed of the checkpoint used for inference-cost profiling.",
+        help="Repeat with one checkpoint-derived inference-cost profile per training seed.",
     )
     parser.add_argument("--diversity-unigram-entropy-bits", type=float)
     parser.add_argument("--diversity-distinct-2", type=float)
@@ -628,10 +765,19 @@ def main() -> None:
     auxiliary = write_auxiliary_metrics(
         record_dir,
         args.inference_cost_json,
-        profiled_train_seed=args.profiled_train_seed,
+        gate_rows,
+        expected_trainer=args.trainer,
         diversity_unigram_entropy_bits=args.diversity_unigram_entropy_bits,
         diversity_distinct_2=args.diversity_distinct_2,
     )
+    mean_inference_tflops = auxiliary["inference_cost"]["mean"][
+        "total_tflops_per_1024_token_sample"
+    ]
+    if not args.experimental and args.trainer == "dlm" and mean_inference_tflops >= args.ar_reference_tflops:
+        raise SystemExit(
+            f"mean inference cost is {mean_inference_tflops:.6f} TFLOPs per 1024-token sample; "
+            f"official DLM records must remain below {args.ar_reference_tflops:.6f} TFLOPs"
+        )
     write_commands(record_dir, args.command)
     copy_environment_json(record_dir, args.environment_json)
     write_recipe_snapshot(record_dir, args.source_file or DEFAULT_SOURCE_FILES, args.snapshot_note)

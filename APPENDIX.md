@@ -60,7 +60,7 @@ Compared with the AR reference, DDiT adds parameters mainly through the untied o
 
 ![nanoGPT-2 vs DDiT total parameters](assets/figures/architecture-params-total.svg)
 
-As a historical reference point, `train_ar.py` reached the previous per-seed gate in **40.6s** on average over 50 seeds. This AR run is not part of the DLM leaderboard, and it predates the checkpoint-derived evaluation seeds and pooled decision, but its record artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
+As a reference point, `train_ar.py` reached [5861/6400 passing samples](records/ar-baseline/quality_gate.json) under the current rule after **40.6s** of training on average over 50 seeds. This AR run is not part of the DLM leaderboard; its artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
 
 One of the main promises of DLMs is lower inference cost: as they can generate many tokens in parallel, they may use fewer model calls than the sequence length. However, the cost of each call matters too. Compared with KV-cached AR generation, DLMs face two main sources of extra FLOPs. First, the use of a KV-cache is in general not possible, so the attention cost remains quadratic in the length of the block being denoised instead of becoming linear. Second, bidirectional attention doubles the attention pairs and the number of token positions processed by each linear layer compared with a causal forward pass.
 
@@ -87,11 +87,11 @@ assert binomtest(4880, 6400, 0.75, alternative="greater").pvalue >= 0.01
 assert binomtest(4881, 6400, 0.75, alternative="greater").pvalue < 0.01
 ```
 
-The same test applies to *average* pass probabilities across the 50 training seeds when pass probabilities differ between checkpoints, see [Hoeffding (1956), 5](https://doi.org/10.1214/aoms/1177728178).
+The same test applies to *average* pass probabilities across the 50 training seeds when pass probabilities differ between checkpoints; see [Hoeffding (1956), 5](https://doi.org/10.1214/aoms/1177728178).
 
 ## Inference cost accounting
 
-Leaderboard TFLOPs use the `total_*` fields in each record's `auxiliary_metrics.json`.
+Leaderboard TFLOPs are the mean of the 50 checkpoint profiles stored in each record's `auxiliary_metrics.json`.
 
 PyTorch measures the FLOPs of different operations with
 
@@ -129,4 +129,4 @@ The profiling is done before record creation with:
 python -m speedrun_dlm.measure_inference_cost ...
 ```
 
-That script runs the sampler, reads PyTorch profiler FLOPs, adds the missing attention FLOPs, and writes the `total_*` fields to an inference-cost JSON file. Then `records/make_record.py` copies that JSON into `auxiliary_metrics.json` and uses the `total_tflops_per_1024_token_sample` field for `records.csv`.
+That script profiles one generated sample, reads PyTorch profiler FLOPs, adds the missing attention FLOPs, and writes the `total_*` fields to an inference-cost JSON file. Run it once for every training checkpoint. `records/make_record.py` verifies that the 50 profiles use the same checkpoints and sampler configurations as the quality gates, stores the individual profiles in `auxiliary_metrics.json`, and uses their mean `total_tflops_per_1024_token_sample` for `records.csv`.
