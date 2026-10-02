@@ -1,132 +1,31 @@
-# speedrun-dlm: Appendix
+# Benchmark details
 
-This appendix provides a few extra details about the code.
+## HellaSwag evaluation
 
-## Models
+We use all 10,042 examples from the [pinned HellaSwag validation split](https://huggingface.co/datasets/Rowan/hellaswag/tree/218ec52e09a7e7462a5400043bb9a69a41d06b76), with preprocessing from the [pinned Language Model Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/4e7e0d47f33bc71070c1d38394bafbb52b117163/lm_eval/tasks/hellaswag).
 
-- `dlm`: small shared DDiT backbone used for all DLM objectives and samplers ([model](speedrun_dlm/train_dlm.py)).
-- `ar`: nanoGPT-2 causal transformer ([model](speedrun_dlm/train_ar.py), purely for reference).
-
-For reference, these are the DDiT parts we match. The code here is our own re-implementation, so any mistake is ours.
-
-| Local component | Upstream anchors |
-| --- | --- |
-| sinusoidal time embedding + `F.silu(time_map(t))` | [MDLM](https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/models/dit.py#L150-L189), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/model/transformer.py#L56-L94), [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L176-L215) |
-| non-causal DDiT block with RoPE and adaLN-Zero gates | [MDLM](https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/models/dit.py#L214-L288), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/model/transformer.py#L118-L189), [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L305-L379) |
-| final LayerNorm + adaLN modulation + linear head | [MDLM](https://github.com/kuleshov-group/mdlm/blob/c112c526d193436838c98d81455ee51f90309470/models/dit.py#L302-L321), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/0605786da5ccb5747545e26d66fdf477187598b6/model/transformer.py#L207-L224), [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L406-L428) |
-| dense and weighted embedding inputs | [DUO](https://github.com/s-sahoo/duo/blob/492505208b361fa330f4703b705abc54cf7ead20/models/dit.py#L382-L403) |
-
-## DLM objectives
-
-`run_dlm.sh` uses `subs_mask` by default. Other objectives can be selected with `--objective`.
-
-When no schedule or time-conditioning flag is passed, the trainer uses the local default for that objective.
-
-The implementations are in [`train_dlm.py`](speedrun_dlm/train_dlm.py).
-
-| Objective | Paper | Noise | Loss | Default sampler |
-| --- | --- | --- | --- | --- |
-| `subs_mask` | [SUBS](https://arxiv.org/abs/2406.07524) | mask | masked x0 weighted CE | `subs_mask_ancestral` |
-| `d3pm_mask` | [D3PM](https://arxiv.org/abs/2107.03006) | mask | D3PM VB + CE with `coef_vb=0.001`, `coef_ce=1.0` | `d3pm_mask_ancestral` |
-| `d3pm_uniform` | [D3PM](https://arxiv.org/abs/2107.03006) | uniform | D3PM full VB with `coef_vb=1.0`, `coef_ce=0.0` | `d3pm_uniform_ancestral` |
-| `sedd_mask` | [SEDD](https://arxiv.org/abs/2310.16834) | mask | SEDD score entropy | `sedd_analytic` |
-| `sedd_uniform` | [SEDD](https://arxiv.org/abs/2310.16834) | uniform | SEDD score entropy | `sedd_analytic` |
-| `duo_uniform` | [DUO](https://arxiv.org/abs/2506.10892) | uniform | DUO uniform diffusion loss | `duo_ancestral` |
-
-Default samplers are used only when `--dlm_sampler auto`.
-
-For `duo_uniform`, the trainer downloads the pinned DUO keep-probability table if `--duo_keep_prob_table_path` is omitted. The table stores `p_clean = P[argmax gaussian latent is the original clean token]` and converts it with `keep_prob = (vocab_size * p_clean - 1) / (vocab_size - 1)`.
-
-For D3PM, the code uses `coef_vb * VB + coef_ce * CE`. In that convention, the [official text config](https://github.com/google-research/google-research/blob/1fa17414f56c3703d5adb3818338b6e35e0fd550/d3pm/text/configs.py#L162-L176) uses `uniform=(1.0, 0.0)` and `mask=(1.0, 0.01)`. This benchmark keeps `d3pm_mask=(0.001, 1.0)` because it produced better text under the current gate.
-
-## Samplers
-
-Sampler names are listed in [`sample_text.py`](speedrun_dlm/sample_text.py).
-
-| Family | Paper | Samplers |
-| --- | --- | --- |
-| AR | [GPT-2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) | top-k next-token sampling |
-| SUBS | [SUBS](https://arxiv.org/abs/2406.07524) | `subs_mask_ancestral` |
-| D3PM | [D3PM](https://arxiv.org/abs/2107.03006) | `d3pm_mask_ancestral`, `d3pm_uniform_ancestral`, uniform checkpoints also allow DUO Psi samplers |
-| SEDD | [SEDD](https://arxiv.org/abs/2310.16834) | `sedd_euler`, `sedd_analytic` |
-| DUO | [DUO](https://arxiv.org/abs/2506.10892), [Psi samplers](https://arxiv.org/abs/2602.21185) | `duo_ancestral`, `duo_greedy_tail`, `duo_psi_rescale`, `duo_psi_capped`, `duo_psi_loop` |
-
-## DDiT and AR reference
-
-The benchmark fixes a small DDiT backbone at roughly nanoGPT-2 scale, with diffusion-specific changes on top. The nanoGPT-2 reference comes from the first commit of the repository [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), yielding the code in `speedrun_dlm/train_ar.py` (up to minor changes).
-We then adapted it to diffusion language models in `speedrun_dlm/train_dlm.py`.
-
-Compared with the AR reference, DDiT adds parameters mainly through the untied output head. The time embedding and adaptive layer norm add much less.
-
-![nanoGPT-2 vs DDiT total parameters](assets/figures/architecture-params-total.svg)
-
-As a reference point, `train_ar.py` reached [5861/6400 passing samples](records/ar-baseline/quality_gate.json) under the current rule after **40.6s** of training on average over 50 seeds. This AR run is not part of the DLM leaderboard; its artifacts are kept in [`records/ar-baseline/`](records/ar-baseline/).
-
-One of the main promises of DLMs is lower inference cost: as they can generate many tokens in parallel, they may use fewer model calls than the sequence length. However, the cost of each call matters too. Compared with KV-cached AR generation, DLMs face two main sources of extra FLOPs. First, the use of a KV-cache is in general not possible, so the attention cost remains quadratic in the length of the block being denoised instead of becoming linear. Second, bidirectional attention doubles the attention pairs and the number of token positions processed by each linear layer compared with a causal forward pass.
-
-In this benchmark, our DDiT samplers do not use KV caching. This is delicate in general: for instance, under uniform diffusion, the same token can be revised several times, so cached states would need to be updated as the sequence changes. We therefore compare against the uncached nanoGPT-2 AR reference, whose cost for generating one 1024-token sample is 95.86 TFLOPs, and use this as the submission cap.
-
-This should not be read as saying that caching is unimportant for DLMs. Quite the opposite: the same AR reference drops from 95.86 TFLOPs uncached to 0.27 TFLOPs with KV cache, a roughly 350x reduction. Diffusion variants compatible with KV caching, like block diffusion, are therefore very promising directions. Here, we focus on what can be achieved in the single-block setting.
-
-More details: [per-block compute](assets/figures/architecture-flops-per-layer.svg), [cost accounting](assets/figures/architecture-additional-flops.svg).
-
-The figures are made with:
-
-```bash
-python assets/figures/make_architecture_plots.py
-```
-
-## Statistical interpretation of the quality gate
-
-The gate requires at least 4881 of the 6400 generated sequences to pass the per-sample quality rule. If the 50 training seeds were to yield i.i.d. per-sample outcomes with the same pass probability `p`, this would be a [one-sided binomial test](https://en.wikipedia.org/wiki/Binomial_test) with significance level `α=0.01` for the null hypothesis that `p ≤ 0.75`. The threshold of `4881` is the smallest integer such that the binomial probability of passing at least that many samples is less than `0.01` under the null hypothesis. This can be verified with SciPy:
-
-```python
-from scipy.stats import binomtest
-
-assert binomtest(4880, 6400, 0.75, alternative="greater").pvalue >= 0.01
-assert binomtest(4881, 6400, 0.75, alternative="greater").pvalue < 0.01
-```
-
-The same test applies to *average* pass probabilities across the 50 training seeds when pass probabilities differ between checkpoints; see [Hoeffding (1956), 5](https://doi.org/10.1214/aoms/1177728178).
-
-## Inference cost accounting
-
-Leaderboard TFLOPs are the mean of the 50 checkpoint profiles stored in each record's `auxiliary_metrics.json`.
-
-PyTorch measures the FLOPs of different operations with
-
-```python
-torch.profiler.profile(with_flops=True)
-```
-
-In our setup, PyTorch reports `0` FLOPs for `scaled_dot_product_attention`.
-So we add the FLOPs for the two attention matrix products by formula:
+For each context and possible ending, we keep the context clean and corrupt only the ending. The model's objective supplies a recovery loss for each corruption. We average these losses, divide by the ending's character count, and select the lowest-scoring ending:
 
 ```text
-QK^T FLOPs = 2 * width * pairs
-AV FLOPs   = 2 * width * pairs
-total attention FLOPs = 4 * width * pairs
+score(ending) = average recovery loss / number of characters in the ending
+prediction = ending with the lowest score
+accuracy = number of correct predictions / 10,042
 ```
 
-Here `width = 768` and there are `12` layers. We count only these two matrix products, not softmax or other small elementwise work.
+SUBS uses the masked-token estimator used by LLaDA. D3PM and SEDD use their corresponding discrete or continuous-time loss terms. DUO uses its Gaussian relaxation and curriculum. The exact terms are in [`evaluate_hellaswag.py`](speedrun_dlm/evaluate_hellaswag.py). Raw losses are compared only among the four endings for one checkpoint.
 
-For one 1024-token sample:
+Evaluation uses seed 314159 and a fixed hash-based random stream. Random draws are shared across checkpoints and, where their corruption processes allow it, across recipes. They do not depend on the checkpoint hash. Context plus ending fits within 256 GPT-2 tokens; the evaluator rejects overflow rather than truncating an answer.
 
-```text
-AR without KV cache:
-12 * 4 * 768 * sum_{t=1}^{1024} t(t+1)/2
+## Training time and target
 
-AR with KV cache:
-12 * 4 * 768 * sum_{t=1}^{1024} t
+The target is **27.5% HellaSwag accuracy averaged over ten independent trainings**. Training time sums optimizer-step durations on two nodes with four GH200 GPUs each, excluding compilation, evaluation, and checkpoint writing.
 
-DLM:
-12 * 4 * 768 * forward_calls * 1024^2
-```
+Checkpoints are saved after the first optimizer step reaching each elapsed minute. We first evaluate minutes 1, 4, 7, ..., 28, every ten minutes from minute 30, and the final checkpoint with 32 corruptions per answer. Evaluations with eight corruptions guide further checks between these points. A three-point confirmation uses 128 corruptions: the previous minute must be below the target, and the selected and following minutes above it. If these scores move the crossing, the search continues with 128 corruptions. The selected minute is the first passing minute with this confirmation and no reversal among later 128-corruption evaluations. Its time is the average of the ten recorded checkpoint times, not an average of ten individual first-crossing times.
 
-The profiling is done before record creation with:
+DUO with the original curriculum passes at minute 41, falls below the target at 42, and passes at 43 and 44 with 128 corruptions, so its reported time is 43 minutes. All measurements remain in the [trace](figures/production-hellaswag-measurement-trace.png), including lower-precision estimates that fall below the target later. Nearby-target comparisons use the largest complete draw count at each measured position and the first pass that stays above the target at later measured positions; only 27.5% receives adjacent-minute confirmation.
 
-```bash
-python -m speedrun_dlm.measure_inference_cost ...
-```
+## Records
 
-That script profiles one generated sample, reads PyTorch profiler FLOPs, adds the missing attention FLOPs, and writes the `total_*` fields to an inference-cost JSON file. Run it once for every training checkpoint. `records/make_record.py` verifies that the 50 profiles use the same checkpoints and sampler configurations as the quality gates, stores the individual profiles in `auxiliary_metrics.json`, and uses their mean `total_tflops_per_1024_token_sample` for `records.csv`.
+Each [record](records/records.csv) includes the ten individual results, their average, all evaluated checkpoints for that recipe, the draw counts used, training parameters, source hashes, and reproduction commands. The [measurement trace](figures/production-hellaswag-measurement-trace.png) shows those evaluations. Recipes that do not reach a target share the last rank in threshold comparisons.
+
+The [corruption comparison](figures/corruption-variation.csv) compares the first 32 and all 128 draws within the same evaluation. The reported standard deviations describe variation across the ten training seeds. The finish line uses their average accuracy, not a confidence bound.

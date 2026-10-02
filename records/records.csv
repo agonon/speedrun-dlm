@@ -1,2 +1,8 @@
-record_id,entry,trainer,fixed_budget_steps,parameters_total,non_embedding_parameters,seeds,passing_samples,samples,pass_rate,quality_gate_pass,mean_timed_seconds,mean_wall_seconds,sampler,nmc,inference_tflops_per_1024_token_sample,torch_profiler_tflops_per_1024_token_sample,attention_tflops_added_by_formula,inference_tflops_vs_ar,parameter_normalized_inference_tflops_vs_ar,diversity_unigram_entropy_bits_mean,diversity_distinct_2_mean,method_reference,recipe_snapshot,benchmark_label,command_log,record_path
-0001,subs_mask,dlm,8000,169626449,131028305,50,5385,6400,0.841406,True,1665.2,1740.6,S=344,326.84,95.4065,82.7726,12.6339,0.9952,0.7294,,,https://arxiv.org/abs/2406.07524,recipe_snapshot.txt,leaderboard50-subs8k-wave01-s344-eps1e3,commands.jsonl,records/0001-subs-mask-s344/
+record,recipe,training_runs,average_training_seconds,average_training_tokens,average_accuracy,corruptions_per_answer,reaches_target
+0001-subs-mask,subs_mask,10,720.1530491590499,1360841932.8,0.27518422624975103,128,True
+0002-d3pm-mask,d3pm_mask,10,1380.0578451156616,2103207526.4,0.2755327623979287,128,True
+0003-sedd-mask,sedd_mask,10,1500.067534661293,2205155328,0.27606054570802624,128,True
+0004-duo-simple,duo_simple,10,2580.12579498291,2225745920,0.27594104760007965,128,True
+0005-duo-efficient,duo_efficient,10,4800.085660409927,5029007360,0.2767377016530571,128,True
+0006-sedd-uniform,sedd_uniform,10,5940.061031103134,8937533440,0.2766480780720972,128,True
+0007-d3pm-uniform,d3pm_uniform,10,12584.55666308403,9830400000,0.27088229436367256,128,False

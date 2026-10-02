@@ -5,15 +5,18 @@ import json
 import math
 import os
 import pickle
+import random
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from urllib.request import urlopen
 
 import numpy as np
 import torch
 import torch._inductor.config as inductor_config
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
@@ -453,7 +456,7 @@ def sample_time(
     # Each training example samples one time for the chosen objective's loss.
     # The training T is only used by D3PM: it samples an integer step in {1..T}.
     # Continuous-time objectives sample one scalar t in [eps, 1]. Text samplers
-    # build their S-step grids in sample_text.py, not from training T.
+    # build their S-step grids independently of training T.
     if objective in {"d3pm_mask", "d3pm_uniform"}:
         if keep_prob_grid is None:
             raise RuntimeError("D3PM training requires its T-step keep-probability grid.")
@@ -594,11 +597,11 @@ def load_duo_keep_prob_table(path: str, device: str) -> dict[str, torch.Tensor |
     path = ensure_duo_keep_prob_table(path)
     with open(path, "rb") as f:
         data = pickle.load(f)
-    # DUO samples a gaussian latent at log-noise ratio gamma 
-    # the DUO loss depends on the keep_prob of the uniform marginals obtained by argmaxing that gaussian latent 
+    # DUO samples a gaussian latent at log-noise ratio gamma
+    # the DUO loss depends on the keep_prob of the uniform marginals obtained by argmaxing that gaussian latent
     # this function loads a precomputed table, pt, used to get keep_prob as a function of gamma:
     # pt stores P(argmax gaussian latent is still the clean token) as a function of gamma, precomputed once since it is a gaussian max probability over vocab_size competitors
-    # it is converted to keep_prob via P(clean) = pt[gamma] in Gaussian formulation = keep_prob + (1 - keep_prob) / vocab_size in uniform formulation 
+    # it is converted to keep_prob via P(clean) = pt[gamma] in Gaussian formulation = keep_prob + (1 - keep_prob) / vocab_size in uniform formulation
     # so keep_prob = (vocab_size * pt[gamma] - 1) / (vocab_size - 1), see duo_keep_prob_from_table() for the conversion
     required = {"vocab_size", "gamma_min", "gamma_max", "num_points", "pt"}
     missing = required.difference(data)
@@ -1338,7 +1341,42 @@ def main():
     parser.add_argument("--val_max_steps", type=int, default=20)
     parser.add_argument("--num_checkpoints", type=int, default=1)
     parser.add_argument("--checkpoint_steps", type=str, default="")
+    parser.add_argument(
+        "--checkpoint_every_timed_minutes",
+        type=float,
+        default=0.0,
+        help=(
+            "Additionally save the first optimizer-step state after every interval of "
+            "timed training. Checkpoint I/O is synchronized outside the timed step."
+        ),
+    )
     parser.add_argument("--skip_checkpoint_save", action="store_true")
+    parser.add_argument(
+        "--save_resume_state",
+        action="store_true",
+        help="Save optimizer, per-rank RNG, data-loader position, and next batch beside each model checkpoint.",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default="",
+        help="Path to a .resume.pt file produced by --save_resume_state.",
+    )
+    parser.add_argument(
+        "--reset_checkpoint_history_on_resume",
+        action="store_true",
+        help=(
+            "Continue the exact optimizer/data/RNG state but start a new checkpoint-file "
+            "history. This is useful when an extension is stored beside, rather than "
+            "inside, its completed prefix trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--resume_checkpoint_steps",
+        type=str,
+        default="",
+        help="Comma-separated checkpoint steps that also retain full resumable state; defaults to every saved checkpoint.",
+    )
     parser.add_argument("--num_diffusion_steps", type=int, default=1000, help="D3PM training steps T; unused by continuous-time objectives")
     parser.add_argument("--cond_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -1396,6 +1434,10 @@ def main():
         raise ValueError("--sequence_length must be between 1 and 1024.")
     if args.num_checkpoints < 1:
         raise ValueError("--num_checkpoints must be at least 1.")
+    if args.checkpoint_every_timed_minutes < 0:
+        raise ValueError("--checkpoint_every_timed_minutes must be non-negative.")
+    if args.resume_from and not os.path.isfile(args.resume_from):
+        raise FileNotFoundError(f"resume state does not exist: {args.resume_from}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this trainer.")
     apply_dlm_objective_defaults(args)
@@ -1426,7 +1468,8 @@ def main():
                 f"continuing with objective={args.objective} for diagnostics."
             )
 
-    init_process_group(backend="nccl")
+    distributed_timeout_minutes = int(os.environ.get("SPEEDRUN_DLM_DISTRIBUTED_TIMEOUT_MINUTES", "10"))
+    init_process_group(backend="nccl", timeout=timedelta(minutes=distributed_timeout_minutes))
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
@@ -1436,6 +1479,7 @@ def main():
     rank_seed = args.seed + ddp_rank
     torch.manual_seed(rank_seed)
     np.random.seed(rank_seed)
+    random.seed(rank_seed)
     print0(f"PyTorch: {torch.version.__version__}")
     print0(f"Device: {device}")
     print0(f"seed: base {args.seed} | rank0 local seed {args.seed}")
@@ -1610,6 +1654,66 @@ def main():
     warmup_loss.backward()
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
+
+    resume_payload = None
+    start_step = 0
+    prior_timed_training_seconds = 0.0
+    prior_wallclock_seconds = 0.0
+    if args.resume_from:
+        resume_payload = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        if resume_payload.get("schema") != "speedrun-dlm-resume-state-v1":
+            raise ValueError("unsupported resume-state schema")
+        if int(resume_payload["world_size"]) != ddp_world_size:
+            raise ValueError("resume world size does not match this launch")
+        saved_args = resume_payload["args"]
+        identity_keys = (
+            "model", "batch_size", "sequence_length", "total_batch_size", "seed",
+            "objective", "noise_schedule", "time_conditioning", "learning_rate",
+            "warmup_iters", "lr_schedule", "weight_decay", "adam_beta1", "adam_beta2",
+            "adam_eps", "grad_clip", "dropout", "antithetic_sampling", "cond_dim",
+            "continuous_time_eps", "geometric_noise_level_min", "geometric_noise_level_max",
+            "subs_mask_normalization", "d3pm_vb_coeff", "d3pm_ce_coeff",
+            "num_diffusion_steps", "duo_curriculum_mode", "duo_top_k",
+            "duo_log_noise_ratio_min", "duo_log_noise_ratio_max",
+            "duo_softmax_temperature_log10_start", "duo_softmax_temperature_log10_end",
+            "duo_curriculum_start", "duo_curriculum_end",
+        )
+        mismatches = {
+            key: (saved_args.get(key), getattr(args, key))
+            for key in identity_keys
+            if key in saved_args and saved_args.get(key) != getattr(args, key)
+        }
+        if mismatches:
+            raise ValueError(f"resume arguments do not match: {mismatches}")
+        saved_iterations = int(saved_args["num_iterations"])
+        if args.lr_schedule == "cosine" and saved_iterations != args.num_iterations:
+            raise ValueError("a cosine-schedule run cannot change --num_iterations when resumed")
+        start_step = int(resume_payload["step"])
+        if not 0 <= start_step < args.num_iterations:
+            raise ValueError("resume step must precede the requested final iteration")
+        model_checkpoint = os.path.join(
+            os.path.dirname(args.resume_from), resume_payload["model_checkpoint"]
+        )
+        model_payload = torch.load(model_checkpoint, map_location=device, weights_only=False)
+        checkpoint_model.load_state_dict(model_payload["model"])
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        rank_state = resume_payload["rank_states"][ddp_rank]
+        if int(rank_state["rank"]) != ddp_rank:
+            raise ValueError("resume rank-state ordering is invalid")
+        train_loader.current_shard = int(rank_state["train_loader_current_shard"])
+        if not 0 <= train_loader.current_shard < len(train_loader.files):
+            raise ValueError("saved data shard is absent from the new training prefix")
+        train_loader.current_position = int(rank_state["train_loader_current_position"])
+        train_loader.tokens = _load_data_shard(train_loader.files[train_loader.current_shard])
+        x = rank_state["next_batch"].to(device=device, dtype=torch.long)
+        torch.set_rng_state(rank_state["torch_cpu_rng_state"])
+        torch.cuda.set_rng_state(rank_state["torch_cuda_rng_state"], device=device)
+        np.random.set_state(rank_state["numpy_rng_state"])
+        random.setstate(rank_state["python_rng_state"])
+        prior_timed_training_seconds = float(resume_payload["timed_training_seconds"])
+        prior_wallclock_seconds = float(resume_payload["total_wallclock_seconds"])
+        dist.barrier()
+        print0(f"Resumed exact training state from step {start_step:,}.")
     overall_t0 = time.perf_counter()
 
     def get_lr(it: int) -> float:
@@ -1628,16 +1732,28 @@ def main():
             return 0.5 * args.learning_rate * (1.0 + math.cos(math.pi * decay_progress))
         raise ValueError(f"Unsupported lr_schedule={args.lr_schedule!r}")
 
-    run_id = str(uuid.uuid4())
+    reset_checkpoint_history = bool(
+        resume_payload and args.reset_checkpoint_history_on_resume
+    )
+    if reset_checkpoint_history:
+        run_id = str(uuid.uuid4())
+    elif resume_payload:
+        run_id = resume_payload.get("run_id", str(uuid.uuid4()))
+    else:
+        run_id = str(uuid.uuid4())
     logfile = None
     last_val_loss = None
     if master_process and args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
         logfile = os.path.join(args.output_dir, f"{run_id}.log")
-        with open(logfile, "w"):
+        with open(logfile, "a"):
             pass
-    checkpoint_paths = []
-    checkpoint_records = []
+    if reset_checkpoint_history or not resume_payload:
+        checkpoint_paths = []
+        checkpoint_records = []
+    else:
+        checkpoint_paths = list(resume_payload.get("checkpoint_paths", []))
+        checkpoint_records = list(resume_payload.get("checkpoint_records", []))
 
     def record_path(path: str) -> str:
         checkpoint_dir = args.output_dir if args.output_dir else "logs"
@@ -1652,51 +1768,138 @@ def main():
             saved_args.pop("num_diffusion_steps", None)
         return saved_args
 
-    def save_checkpoint(tag: str, step: int, timed_elapsed: float, wall_elapsed: float) -> str:
+    def capture_rank_resume_state() -> dict:
+        return {
+            "rank": ddp_rank,
+            "torch_cpu_rng_state": torch.get_rng_state(),
+            "torch_cuda_rng_state": torch.cuda.get_rng_state(device=device).cpu(),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "train_loader_current_shard": train_loader.current_shard,
+            "train_loader_current_position": train_loader.current_position,
+            "next_batch": x.detach().cpu(),
+        }
+
+    def save_checkpoint(
+        tag: str,
+        step: int,
+        timed_elapsed: float,
+        wall_elapsed: float,
+        rank_state_override: dict | None = None,
+        save_resume: bool = False,
+        reasons: tuple[str, ...] = (),
+    ) -> str:
         if args.skip_checkpoint_save:
             return ""
         checkpoint_dir = args.output_dir if args.output_dir else "logs"
         os.makedirs(checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(checkpoint_dir, f"{run_id}_{tag}.pt")
-        log = dict(
-            model=checkpoint_model.state_dict(),
-            ema_model=None,
-            code=code,
-            args={**checkpoint_args(), "recipe": args.objective},
-            trainer="dlm",
-            checkpoint_tag=tag,
-            checkpoint_step=step,
+        metadata_path = record_path(checkpoint_path)
+        record = dict(
+            path=metadata_path,
+            tag=tag,
+            step=step,
             timed_training_seconds=timed_elapsed,
             total_wallclock_seconds=wall_elapsed,
             total_tokens_processed=tokens_per_step * step,
+            reasons=list(reasons),
         )
-        torch.save(log, checkpoint_path)
-        metadata_path = record_path(checkpoint_path)
-        checkpoint_paths.append(metadata_path)
-        checkpoint_records.append(
-            dict(
-                path=metadata_path,
-                tag=tag,
-                step=step,
+        rank_states = None
+        if args.save_resume_state and save_resume:
+            rank_states = [None] * ddp_world_size if master_process else None
+            dist.gather_object(
+                rank_state_override or capture_rank_resume_state(),
+                rank_states,
+                dst=0,
+            )
+        if master_process:
+            log = dict(
+                model=checkpoint_model.state_dict(),
+                ema_model=None,
+                code=code,
+                args={**checkpoint_args(), "recipe": args.objective},
+                trainer="dlm",
+                checkpoint_tag=tag,
+                checkpoint_step=step,
                 timed_training_seconds=timed_elapsed,
                 total_wallclock_seconds=wall_elapsed,
                 total_tokens_processed=tokens_per_step * step,
+                checkpoint_records=[*checkpoint_records, record],
             )
-        )
-        return checkpoint_path
+            torch.save(log, checkpoint_path)
+            checkpoint_paths.append(metadata_path)
+            checkpoint_records.append(record)
+            if args.save_resume_state and save_resume:
+                resume_path = os.path.join(checkpoint_dir, f"{run_id}_{tag}.resume.pt")
+                torch.save(
+                    {
+                        "schema": "speedrun-dlm-resume-state-v1",
+                        "run_id": run_id,
+                        "step": step,
+                        "world_size": ddp_world_size,
+                        "model_checkpoint": os.path.basename(checkpoint_path),
+                        "optimizer": optimizer.state_dict(),
+                        "rank_states": rank_states,
+                        "args": checkpoint_args(),
+                        "timed_training_seconds": timed_elapsed,
+                        "total_wallclock_seconds": wall_elapsed,
+                        "checkpoint_paths": list(checkpoint_paths),
+                        "checkpoint_records": list(checkpoint_records),
+                    },
+                    resume_path,
+                )
+        if args.save_resume_state and save_resume:
+            dist.barrier()
+        return checkpoint_path if master_process else ""
 
     if args.checkpoint_steps:
         checkpoint_steps = {int(item) for item in args.checkpoint_steps.split(",") if item.strip()}
     else:
         checkpoint_steps = {int(round(k * args.num_iterations / args.num_checkpoints)) for k in range(1, args.num_checkpoints + 1)}
-    checkpoint_steps = {step for step in checkpoint_steps if 0 < step <= args.num_iterations}
+    checkpoint_steps = {step for step in checkpoint_steps if 0 <= step <= args.num_iterations}
+    if args.resume_checkpoint_steps:
+        resume_checkpoint_steps = {
+            int(item) for item in args.resume_checkpoint_steps.split(",") if item.strip()
+        }
+        if not resume_checkpoint_steps.issubset(checkpoint_steps):
+            raise ValueError("--resume_checkpoint_steps must be a subset of --checkpoint_steps")
+    else:
+        resume_checkpoint_steps = set(checkpoint_steps)
+    if args.save_resume_state:
+        resume_checkpoint_steps.add(args.num_iterations)
+
+    # Step zero is the actual parameter state from which the first optimizer
+    # update starts. The compile warmup above performs a forward/backward pass
+    # but deliberately clears gradients without stepping the optimizer.
+    if (master_process or (args.save_resume_state and 0 in resume_checkpoint_steps)) and start_step == 0 and 0 in checkpoint_steps:
+        save_checkpoint(
+            "step000000",
+            0,
+            0.0,
+            time.perf_counter() - overall_t0,
+            save_resume=0 in resume_checkpoint_steps,
+            reasons=("initialization", "token_grid"),
+        )
 
     timings = []
-    timed_training_seconds = 0.0
+    timed_training_seconds = prior_timed_training_seconds
     norm = -1.0
     lossf = None
-    for step in range(args.num_iterations + 1):
+    final_rank_state = None
+    timed_checkpoint_interval_seconds = 60.0 * args.checkpoint_every_timed_minutes
+    last_timed_checkpoint_index = (
+        int(prior_timed_training_seconds // timed_checkpoint_interval_seconds)
+        if timed_checkpoint_interval_seconds > 0
+        else 0
+    )
+    for step in range(start_step, args.num_iterations + 1):
         last_step = step == args.num_iterations
+
+        # Validation is allowed to draw random corruptions.  At the final step,
+        # preserve the pre-validation training state so a later continuation is
+        # identical to a run that had never stopped here.
+        if last_step and args.save_resume_state:
+            final_rank_state = capture_rank_resume_state()
 
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step) and val_loader is not None:
             model.eval()
@@ -1753,13 +1956,53 @@ def main():
                 f.write(f"s:{step} trl:{lossf}\n")
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1 - t0)
-        if master_process and (step + 1) in checkpoint_steps and (step + 1) != args.num_iterations:
-            save_checkpoint(
-                f"step{step + 1:06d}",
-                step + 1,
-                timed_training_seconds,
-                time.perf_counter() - overall_t0,
-            )
+        checkpoint_step = step + 1
+        static_checkpoint_due = (
+            checkpoint_step in checkpoint_steps and checkpoint_step != args.num_iterations
+        )
+        timed_checkpoint_index = last_timed_checkpoint_index
+        if timed_checkpoint_interval_seconds > 0:
+            trigger = torch.zeros(1, dtype=torch.int64, device=device)
+            if master_process:
+                observed_index = int(timed_training_seconds // timed_checkpoint_interval_seconds)
+                if observed_index > last_timed_checkpoint_index:
+                    trigger[0] = observed_index
+            dist.broadcast(trigger, src=0)
+            timed_checkpoint_index = int(trigger.item())
+        # The final checkpoint is written below with its stable ``final`` tag.
+        # Do not also write a timed checkpoint for the same post-update state
+        # when the last optimizer step happens to cross a minute boundary.
+        timed_checkpoint_due = (
+            timed_checkpoint_index > last_timed_checkpoint_index
+            and checkpoint_step != args.num_iterations
+        )
+        if timed_checkpoint_due:
+            last_timed_checkpoint_index = timed_checkpoint_index
+
+        if static_checkpoint_due or timed_checkpoint_due:
+            should_resume = checkpoint_step in resume_checkpoint_steps
+            reasons = []
+            if static_checkpoint_due:
+                reasons.append("token_grid")
+            if timed_checkpoint_due:
+                reasons.append(
+                    f"timed_interval_{args.checkpoint_every_timed_minutes:g}m_"
+                    f"index{timed_checkpoint_index}"
+                )
+
+            # Every rank waits outside the timed optimizer step. This keeps the
+            # benchmark training timer independent of checkpoint frequency.
+            dist.barrier()
+            if master_process or (args.save_resume_state and should_resume):
+                save_checkpoint(
+                    f"step{checkpoint_step:06d}",
+                    checkpoint_step,
+                    timed_training_seconds,
+                    prior_wallclock_seconds + time.perf_counter() - overall_t0,
+                    save_resume=should_resume,
+                    reasons=tuple(reasons),
+                )
+            dist.barrier()
 
     timings = timings[-20:]
     avg_last_step_ms = float(np.mean(timings) * 1000) if timings else None
@@ -1769,15 +2012,20 @@ def main():
         print0(f"final {len(timings)} iters avg: {avg_last_step_ms:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-    if master_process:
-        final_checkpoint_wallclock_seconds = time.perf_counter() - overall_t0
+    final_checkpoint_wallclock_seconds = prior_wallclock_seconds + time.perf_counter() - overall_t0
+    checkpoint_path = ""
+    if master_process or args.save_resume_state:
         checkpoint_path = save_checkpoint(
             "final",
             args.num_iterations,
             timed_training_seconds,
             final_checkpoint_wallclock_seconds,
+            rank_state_override=final_rank_state,
+            save_resume=True,
+            reasons=("final", "token_grid"),
         )
-        total_wallclock_seconds = time.perf_counter() - overall_t0
+    if master_process:
+        total_wallclock_seconds = prior_wallclock_seconds + time.perf_counter() - overall_t0
         summary = dict(
             trainer="dlm",
             run_id=run_id,

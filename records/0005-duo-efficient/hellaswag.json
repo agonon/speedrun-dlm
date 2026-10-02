@@ -1,0 +1,14 @@
+{
+  "accuracy_standard_deviation": 0.003396177537656158,
+  "average_accuracy": 0.2767377016530571,
+  "average_training_seconds": 4800.085660409927,
+  "average_training_tokens": 5029007360,
+  "corruptions_per_answer": 128,
+  "examples_per_training": 10042,
+  "position": "minute:080",
+  "reaches_target": true,
+  "recipe": "duo_efficient",
+  "target_accuracy": 0.275,
+  "training_runs": 10,
+  "training_seconds_standard_deviation": 0.04333632507883007
+}

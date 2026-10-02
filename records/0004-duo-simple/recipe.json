@@ -1,0 +1,60 @@
+{
+  "evaluation": {
+    "batch_size": 32,
+    "choice_randomness": "coupled",
+    "duo_batch_size": 4,
+    "examples": 10042,
+    "max_length": 256,
+    "sampling_scheme": "randomized_lattice",
+    "scoring_scope": "conditional",
+    "seed": 314159
+  },
+  "hardware": "two nodes of four GH200 GPUs",
+  "source_sha256": {
+    "speedrun_dlm/_hellaswag.py": "318d0b8f563fcb1970f4e7ae35133e12c7e101648c355234ba60d8baf027d027",
+    "speedrun_dlm/evaluate_hellaswag.py": "a44d691aae5043be4e95ccf30317a5fe66d8aa080785ec00152e19dd349d5fa6",
+    "speedrun_dlm/train_dlm.py": "26913f30dec2f0adedea69d51463c464fd254567e8722620a0a9f654312df094"
+  },
+  "training_arguments": {
+    "antithetic_sampling": true,
+    "batch_size": 25,
+    "checkpoint_every_timed_minutes": 1,
+    "checkpoint_steps": "0",
+    "dropout": 0.0,
+    "duo_curriculum_end": 500000,
+    "duo_curriculum_mode": "dense_softmax",
+    "duo_curriculum_start": 0,
+    "duo_keep_prob_table_path": "data/duo-gpt2.pkl",
+    "duo_log_noise_ratio_max": -1.85,
+    "duo_log_noise_ratio_min": -3.55,
+    "duo_softmax_temperature_log10_end": -3.0,
+    "duo_softmax_temperature_log10_start": -3.0,
+    "duo_top_k": 32,
+    "learning_rate": 0.0003,
+    "lr_schedule": "constant",
+    "model": "d12",
+    "noise_schedule": "linear",
+    "num_checkpoints": 1,
+    "num_iterations": 39062,
+    "objective": "duo_uniform",
+    "save_resume_state": true,
+    "sequence_length": 1024,
+    "time_conditioning": true,
+    "total_batch_size": 204800,
+    "val_loss_every": 39062,
+    "val_max_steps": 8,
+    "warmup_iters": 384
+  },
+  "training_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ]
+}

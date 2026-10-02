@@ -1,71 +1,72 @@
 # speedrun-dlm: A speedrun benchmark for diffusion language models
 
-**Train a diffusion language model (DLM) as fast as possible to generate decent text.**
+**Train a diffusion language model (DLM) as fast as possible to reach a HellaSwag target.**
 
 This repository asks how quickly one can train a diffusion language model on
-*FineWeb*, using *8 H100s*, until it generates 1024-token samples that are good
-enough to pass a simple quality gate.
+*FineWeb*, using *8 GH200 GPUs*, until its average HellaSwag accuracy reaches **27.5%**.
 
-**The leaderboard is based on generated samples passing this gate (using Gen. PPL plus additional checks for failure modes of PPL alone, like token repetition and coherence).**
-
-The **gate** checks for:
-
-- too much repetition,
-- basic document coherence,
-- quality according to a pinned reference LLM (`Qwen2.5-7B`),
-- other simple heuristics (more details below).
+**The leaderboard reports the average checkpoint time when HellaSwag accuracy across ten independent trainings reaches the target.**
 
 The project is inspired by Keller Jordan and collaborators' **[modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun** and adapts it to diffusion language models, for which many core design choices are still open.
 
-We fix a small DDiT backbone (170M parameters) and include re-implementations of **7 common single-block diffusion objectives** in `speedrun_dlm/train_dlm.py`.
+We fix a small DDiT backbone (170M parameters) and include re-implementations of **7 common single-block diffusion recipes** in `speedrun_dlm/train_dlm.py`.
 
 > Note. Original methods and ideas belong to their respective authors. This is an independent project and is not affiliated with modded-nanogpt, its contributors, or the authors of the papers we cite.
-
 
 ## Contents
 
 - [Leaderboard](#leaderboard)
 - [Rules](#rules)
 - [Model](#model)
-- [Quality gate](#quality-gate)
+- [HellaSwag target](#hellaswag-target)
 - [How to submit](#how-to-submit)
 - [Run](#run)
 - [Check a candidate](#check-a-candidate)
 - [Appendix](APPENDIX.md)
+- [Accompanying paper](https://openreview.net/forum?id=WLNBGbEQnV)
 - [Acknowledgements](#acknowledgements)
 
 ## Leaderboard
 
-**Runs are ranked by training time to pass the sample-quality gate.**
+**Runs are ranked by training time to reach the HellaSwag target.**
 
-To appear on the leaderboard, a DLM training-and-sampling recipe must:
+To appear on the leaderboard, a DLM training recipe must reach **27.5% average accuracy** over ten independent trainings. Small tuning changes, new objectives, and architectural changes at the fixed model scale are all welcome.
 
-- pass the quality gate (see [Rules](#rules) for the exact criterion), and
-- have a mean generation cost below 95.86 TFLOPs per 1024-token sample (this threshold is explained in the [appendix](APPENDIX.md)).
+| Rank by train time | Entry | Mean train time | Mean training tokens | Record |
+| ---: | --- | ---: | ---: | --- |
+| 1 | SUBS | 12.0 min | 1.36B | [0001](records/0001-subs-mask/) |
+| 2 | D3PM mask | 23.0 min | 2.10B | [0002](records/0002-d3pm-mask/) |
+| 3 | SEDD mask | 25.0 min | 2.21B | [0003](records/0003-sedd-mask/) |
+| 4 | DUO, original curriculum | 43.0 min | 2.23B | [0004](records/0004-duo-simple/) |
+| 5 | DUO, top-k approximation | 80.0 min | 5.03B | [0005](records/0005-duo-efficient/) |
+| 6 | SEDD uniform | 99.0 min | 8.94B | [0006](records/0006-sedd-uniform/) |
+| — | D3PM uniform | not reached by 209.7 min | 9.83B | [0007](records/0007-d3pm-uniform/) |
 
-Small tuning changes, new samplers, and new objectives are all welcome.
+Each record contains per-training times, scores, checkpoint hashes, evaluation settings, and commands. The [measurement table](figures/checkpoint-evaluations.csv) contains all evaluated positions, and [records.csv](records/records.csv) collects the results above.
 
-The FLOP cap is meant to keep samplers reasonable in terms of inference cost. A diffusion sampler could otherwise try to pass the gate by using an arbitrarily large number of denoising steps.
+All six finishers have one-minute failing/passing/passing checks with 128 corruptions per answer. These checks use average accuracy over all ten trainings; the reported time is not an average of ten individual crossing times. See the [crossing checks](figures/crossing-confirmations.csv) and [evaluation details](APPENDIX.md).
 
-| Rank by train time | Entry | Mean train time (used for ranking) | Gate result (need ≥4881/6400) | Mean 1024-token generation cost (need <95.86 TFLOPs) | Mean model calls for 1024 tokens | Training tokens | Training steps | Record |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | `subs_mask` | [27m45.2s](records/0001-subs-mask-s344/training_runs.jsonl) | [5385/6400](records/0001-subs-mask-s344/quality_gate.json) | [95.41 TFLOPs](records/0001-subs-mask-s344/auxiliary_metrics.json) | [326.84](records/0001-subs-mask-s344/auxiliary_metrics.json) | [3.28B](records/0001-subs-mask-s344/training_runs.jsonl) | [8000](records/0001-subs-mask-s344/training_runs.jsonl) | [0001](records/0001-subs-mask-s344/) |
+Our [accompanying paper](https://openreview.net/forum?id=WLNBGbEQnV) explains how we chose HellaSwag by studying the stability of recipe rankings, improvement during training, and agreement with autoregressive reference rankings.
 
-Inference TFLOPs are FLOPs counted by PyTorch while sampling, plus the attention FLOPs PyTorch did not count. See the [appendix](APPENDIX.md) for the formula.
+![HellaSwag speedrun](figures/production-hellaswag-leaderboard.png)
+
+SUBS is first at targets from 26.0% to 28.0%. At 25.5%, D3PM mask is first.
+The three masked recipes occupy the first three places from 26.5% onward,
+with D3PM mask and SEDD mask both reaching the measured 28.0% crossing at about 40 minutes. Only the 27.5% target receives adjacent-minute confirmation; nearby-target rankings use the measured checkpoint grid.
+
+![Ranking across nearby targets](figures/production-hellaswag-target-sensitivity.png)
+
+![HellaSwag accuracy over training time](figures/production-hellaswag-overlay.png)
 
 ## Rules
 
-- Same *data*: pinned FineWeb GPT-2 tokenized data.
-- Same *scorer*: pinned `Qwen/Qwen2.5-7B`.
-- Same *hardware*: 8 H100 80GB GPUs.
-- Same per-sample *quality rule*: a conjunction of checks for repetition, surface validity, reference-model BPB (Gen. PPL), sentence order, and document coherence, defined exactly in [`generation_quality_rule.json`](generation_quality_rule.json) and [`score_generation_quality.py`](speedrun_dlm/score_generation_quality.py).
-- Same 50 *training seeds*: every official entry must run each integer seed from `1` through `50`.
-- Same training *budget across seeds*: all 50 runs for an entry must use the same number of training steps and process the same number of tokens.
-- Checkpoint-derived *evaluation randomness*: separate seeds for sampling, inference-cost profiling, and randomized quality checks are automatically derived from a hash of the checkpoint to evaluate. This follows a helpful suggestion by [@JCBrouwer in issue #1](https://github.com/agonon/speedrun-dlm/issues/1). For reproducibility, text is always sampled with a fixed batch size of 16.
-- From each of the 50 trained checkpoints, generate 128 sequences of 1024 tokens, starting from a fully noised state (all mask tokens for mask-noise models or uniformly random tokens for uniform-noise models). (For comparison, AR models can start from a single token; we used GPT-2's beginning-of-text token for the AR model mentioned in the [Appendix](APPENDIX.md).)
-- Of the resulting `50 × 128 = 6400` sequences, at least `4881` must pass the per-sample quality rule. See the [Appendix](APPENDIX.md#statistical-interpretation-of-the-quality-gate) for the statistical interpretation as a one-sided binomial test.
-- The mean inference cost across the 50 checkpoint-derived profiles, using the same sampler configuration as the quality gate, must be less than 95.86 TFLOPs per 1024-token sample.
-- Runs are ranked by mean training time over 50 seeds.
+- Same *data*: pinned FineWeb GPT-2-tokenized data.
+- Same *hardware*: two nodes with 4 GH200 GPUs each.
+- Same *model scale*: the DDiT backbone described below.
+- Same *number of trainings*: ten independent runs, using seeds 1–10 for the records above.
+- Same *HellaSwag evaluation*: all 10,042 examples in the public validation split, with the prompt convention from the pinned Language Model Evaluation Harness.
+- The *target* is 27.5% accuracy averaged across the ten trainings. Each training contributes equally.
+- Runs are ranked by mean elapsed optimizer-step training time. Compilation, evaluation, and checkpoint writing are outside the clock.
 
 While architectural modifications are acceptable, the DDiT backbone parameter count should remain comparable.
 
@@ -82,26 +83,16 @@ The benchmark fixes a small DDiT backbone at roughly nanoGPT-2 scale:
 The diffusion-specific changes are:
 
 - non-causal attention,
-- denoising-time conditioning through adaptive layer norm,
+- denoising-time conditioning through adaptive layer norm, where used by the recipe,
 - untied input embedding and output head.
 
-See the [appendix](APPENDIX.md) for the short comparison with the AR reference used to set the FLOP cap.
+## HellaSwag target
 
-## Quality gate
+**DLMs are not easy to compare** because their full-sequence probabilities are expensive to estimate, and their training losses are not directly comparable across recipes.
 
-**DLMs are not easy to compare** because:
+This benchmark instead asks each trained model to choose the correct continuation from four possible answers on HellaSwag, without finetuning. The prompt stays unchanged, parts of each answer are corrupted, and the model scores how well it can recover the answer. We average over several corruptions and choose the answer with the lowest score per character. Random choice gives 25%; the target is 27.5%.
 
-- there is no direct access to the **sequence-level probability** assigned by a model: unlike for an AR model, this requires estimating the sum over all possible denoising paths to reach a given sample, which is expensive and leads to high-variance estimates,
-- the **different losses** in current popular recipes are not directly comparable (even when they constitute variational bounds on the negative log-likelihood, these bounds may have different tightness across parameterizations),
-- the **sampler** used at inference time must be taken into account, since the same DLM checkpoint can produce different text under different sampling procedures.
-
-This benchmark **evaluates a trained model together with a sampler** by:
-
-1. Generating 128 unconditional samples of 1024 tokens for each of the 50 training seeds, following the initialization protocol specified in the [Rules](#rules).
-2. Applying the quality rule to every sample (repetition, fluency, etc.).
-3. Deciding whether the DLM training-and-sampling recipe passes by counting how many of the `50 × 128 = 6400` samples pass the quality rule. At least `4881` must pass for the entry to be eligible for the speedrun leaderboard.
-
-See [`score_generation_quality.py`](speedrun_dlm/score_generation_quality.py) and [`generation_quality_rule.json`](generation_quality_rule.json) for details.
+The code compares the four answer scores within each model. It does not compare the raw losses of different recipes. See [`evaluate_hellaswag.py`](speedrun_dlm/evaluate_hellaswag.py), [`finish_line_rule.json`](finish_line_rule.json), and the [appendix](APPENDIX.md) for the evaluation details.
 
 ## How to submit
 
@@ -111,98 +102,61 @@ To get your method on the leaderboard, **open a pull request** with:
 - a new row in [`records/records.csv`](records/records.csv),
 - any code needed to run the method.
 
-If you use the current trainer, sampler, and scorer outputs, you can create the record folder with [`records/make_record.py`](records/make_record.py):
+Include the ten training results, evaluation outputs, training commands, and checkpoint hashes, following the existing records. [`records/make_record.py`](records/make_record.py) builds the result files from a per-training measurement table:
 
 ```bash
-gate_args=()
-inference_args=()
-for seed in $(seq 1 50); do
-  gate_args+=(--gate-dir "results/my_method/gate_seed_${seed}")
-  inference_args+=(--inference-cost-json "results/my_method/inference_cost_seed_${seed}.json")
-done
-
-python3 records/make_record.py \
-  --record-dir records/nextfreeid-my-method \
-  --record-id nextfreeid \
-  --entry my_method \
-  --trainer dlm \
-  --sampler S=mysamplingsteps \
-  --training-runs-jsonl results/my_method/training_runs.jsonl \
-  "${gate_args[@]}" \
-  "${inference_args[@]}" \
-  --environment-json results/my_method/train_seed_1/environment.json \
-  --records-csv records/records.csv
+python records/make_record.py \
+  --entry subs_mask --position minute:012 \
+  --measurements figures/checkpoint-evaluations.csv \
+  --record-dir results/rebuilt-subs-record
 ```
 
-Each submitted record must satisfy the [rules](#rules) above. We will check the timing and record artifacts on our cluster for each PR.
+Each submitted record must satisfy the [rules](#rules) above. We will check the timing and evaluation artifacts before updating the leaderboard.
 
 ## Run
-
-![Edit, run, check, record](assets/demo.gif)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -c constraints.txt -r requirements.txt
 
-bash prepare_data.sh
-bash run_ar.sh
-bash run_dlm.sh
+bash prepare_data.sh 9830400001
+python data/prepare_training_prefix.py \
+  --shards data/fineweb10B/fineweb_train_*.bin \
+  --target-tokens 9830400000 --output-shards 6 \
+  --output-dir data/training-prefix --name-prefix fineweb_train \
+  --manifest data/training-prefix/manifest.json
+python -m speedrun_dlm.prepare_hellaswag data/hellaswag-validation.jsonl.gz
+
+python records/reproduce.py records/0001-subs-mask \
+  --seed 1 --output results/subs/seed1 --execute
 ```
+
+The data are prepared once and reused for every model. The prefix preparation keeps the ordered token stream the same across different batch sizes. Repeat for seeds 1–10 and use the other record folders for their training configurations.
+
+The command above uses eight GPUs on one node. For the recorded two-node setup, set `NNODES=2`, `NPROC_PER_NODE=4`, `MASTER_ADDR` to the first node, and `NODE_RANK=0` or `1`, then run the command on both nodes. Without `--execute`, it prints the complete command for inspection.
 
 ## Check a candidate
 
 ```bash
-python3 -m speedrun_dlm.score_generation_quality path/to/checkpoint.pt \
-  --samples 128 \
-  --tokens 1024 \
-  --top_k 0 \
-  --num_sampling_steps 344 \
-  --sampling_eps 1e-3 \
-  --output_dir results/gate
+python -m speedrun_dlm.evaluate_hellaswag path/to/checkpoint.pt \
+  --data data/hellaswag-validation.jsonl.gz \
+  --output results/hellaswag \
+  --mc-samples 128 --prefixes 32,128 \
+  --sampling-scheme randomized_lattice --seed 314159 \
+  --duo-keep-prob-table data/duo-gpt2.pkl
 ```
 
-This command records the sample-level outcomes for one checkpoint. The official pass/fail result is produced by `records/make_record.py` after all 50 outputs are provided.
-
-```bash
-python3 -m speedrun_dlm.measure_inference_cost path/to/checkpoint.pt \
-  --tokens 1024 \
-  --top_k 0 \
-  --num_sampling_steps 344 \
-  --sampling_eps 1e-3 \
-  --output_json results/inference_cost_seed_1.json
-```
-
-Run the profiler once for each training checkpoint. The record builder verifies that the profiles and quality gates use the same 50 checkpoints and sampler configurations, then averages their inference costs.
+This command records the scores and per-example outcomes for one checkpoint. Repeat for the ten trainings, then average their accuracies. The data file can be anywhere: pass its path with `--data`.
 
 ## Appendix
 
-**More details on objectives, samplers, architecture, and figures are in [the appendix](APPENDIX.md).**
+**More details on evaluation, timing, and recorded results are in [the appendix](APPENDIX.md).**
 
 ## Acknowledgements
 
 This repo builds on a lot of useful public work. In particular, we used:
 
-- [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) for the speedrun setup and AR reference,
-- [MDLM](https://github.com/kuleshov-group/mdlm), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion), [D3PM](https://github.com/google-research/google-research/tree/master/d3pm), and [DUO](https://github.com/s-sahoo/duo) for the different DLM objectives and samplers,
-- [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb), [fineweb10B-gpt2](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2), and [Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B) for the data and Gen PPL scorer.
-
-## Cite as
-
-The first version of this benchmark was created by Antoine Gonon, Adrian Müller,
-Léon Zheng, Zebang Shen, Clément Lalanne, Ya-Ping Hsieh, Anthony Bardou, and
-Nicolas Boumal.
-
-```bibtex
-@misc{speedrun_dlm,
-  title = {speedrun-dlm: A speedrun benchmark for diffusion language models},
-  author = {Gonon, Antoine and Müller, Adrian and Zheng, Léon and Shen, Zebang and Lalanne, Clément and Hsieh, Ya-Ping and Bardou, Anthony and Boumal, Nicolas},
-  year = {2026}
-}
-```
-
-## Contact
-
-For private questions or feedback, feel free to reach out to `antoine.gonon@epfl.ch`.
-
-For bugs, reproducibility issues, or proposed changes, please open a GitHub issue or PR.
+- [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) for the speedrun setup,
+- [MDLM](https://github.com/kuleshov-group/mdlm), [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion), [D3PM](https://github.com/google-research/google-research/tree/master/d3pm), and [DUO](https://github.com/s-sahoo/duo) for the different DLM objectives,
+- [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb), [fineweb10B-gpt2](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2), [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), and the [Language Model Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness) for the data and evaluation convention.

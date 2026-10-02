@@ -1,0 +1,14 @@
+{
+  "accuracy_standard_deviation": 0.0014406313757898952,
+  "average_accuracy": 0.27606054570802624,
+  "average_training_seconds": 1500.067534661293,
+  "average_training_tokens": 2205155328,
+  "corruptions_per_answer": 128,
+  "examples_per_training": 10042,
+  "position": "minute:025",
+  "reaches_target": true,
+  "recipe": "sedd_mask",
+  "target_accuracy": 0.275,
+  "training_runs": 10,
+  "training_seconds_standard_deviation": 0.02659331203165215
+}

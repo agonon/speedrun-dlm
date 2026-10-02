@@ -31,7 +31,7 @@ PINNED_FINEWEB_COMMIT = "9bb295ddab0e05d785b879661af7260fed5140fc"
 
 
 def write_datafile(filename, toks):
-    """ 
+    """
     Saves token data as a .bin file, for reading in C.
     - First comes a header with 256 int32s
     - The tokens follow, each as a uint16

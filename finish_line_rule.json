@@ -1,0 +1,11 @@
+{
+  "schema": "speedrun-dlm-finish-line-v2",
+  "hellaswag_accuracy_min": 0.275,
+  "hellaswag_split": "Rowan/hellaswag validation",
+  "hellaswag_examples": 10042,
+  "hellaswag_mc_samples": 32,
+  "hellaswag_confirmation_mc_samples": 128,
+  "training_runs_per_recipe": 10,
+  "training_hardware": "two nodes with four GH200 GPUs each",
+  "ranking_unit": "mean elapsed optimizer-step time"
+}

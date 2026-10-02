@@ -1,0 +1,14 @@
+{
+  "accuracy_standard_deviation": 0.004483219394806997,
+  "average_accuracy": 0.27088229436367256,
+  "average_training_seconds": 12584.55666308403,
+  "average_training_tokens": 9830400000,
+  "corruptions_per_answer": 128,
+  "examples_per_training": 10042,
+  "position": "tokens:9830400000",
+  "reaches_target": false,
+  "recipe": "d3pm_uniform",
+  "target_accuracy": 0.275,
+  "training_runs": 10,
+  "training_seconds_standard_deviation": 114.83161727135574
+}

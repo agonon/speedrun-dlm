@@ -5,7 +5,6 @@ import tiktoken
 import torch
 import torch.nn.functional as F
 
-from .train_ar import GPT, get_model_config as get_ar_model_config
 from .train_dlm import (
     DEFAULT_GEOMETRIC_NOISE_LEVEL_MIN,
     DEFAULT_GEOMETRIC_NOISE_LEVEL_MAX,
@@ -43,9 +42,7 @@ def load_snapshot(snapshot_path: str, device: str, checkpoint_variant: str = "au
     checkpoint = torch.load(snapshot_path, map_location="cpu")
     trainer = checkpoint.get("trainer")
     args = checkpoint["args"]
-    if trainer == "ar":
-        model = GPT(get_ar_model_config(args["model"]))
-    elif trainer == "dlm":
+    if trainer == "dlm":
         model = DiffusionTransformer(
             get_dlm_model_config(
                 args["model"],
@@ -55,7 +52,7 @@ def load_snapshot(snapshot_path: str, device: str, checkpoint_variant: str = "au
             )
         )
     else:
-        raise ValueError(f"Unsupported trainer in snapshot: {trainer}")
+        raise ValueError(f"Expected a DLM checkpoint, found trainer={trainer!r}")
 
     if checkpoint_variant == "auto":
         state_dict_key = "ema_model" if checkpoint.get("ema_model") is not None else "model"
